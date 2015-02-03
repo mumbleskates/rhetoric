@@ -1,0 +1,64 @@
+Key:
+pr	protected
+o	override to make things happen!
+Opr	both!
+A	abstract! Must be overridden.
+Xpr you don't need to use this ever
+*	fucking stupid, probably going to change
+
+
+CONTAINER CLASS
+	Container(Container spawnHere, String preposition, double containerSize, double maxLength, double maxWidth) - init
+	
+	final static double defaultWidth(double size, double length) - gets a reasonable default width for these dimensions
+	final static array(String... s) - easy, gives back all arguments as an array
+	
+	final static getByName(String name) - get a container from the internal registry by its unique name
+	final long iD - unique identifier
+	final long getID() - gets the unique identifier
+	final String toString() - returns this object's unique identifying string
+	final String des(Detail detail, Report r) - puts the requested description of the object in the report
+	final Name name() - returns this object's name
+*	final String preposition() - preposition for this item in its container (in, on, of etc.)
+	String des(Detail detail) - returns a description of this object with the given level of detail
+	StringBuilder readContents(StringBuilder, Detail) - reads the contents of this object into the StringBuilder with the given level of detail
+	
+	final Iterator<Active> iterator() - contents of the container
+	final int contentCount() - returns total count of objects in this one
+	final int contentCountDeep() - returns total count of all objects in this one, and all those objects' contents, etc.
+	
+	final Container container() - returns the object's container (null if it's a room)
+	final Active activeContainer() - returns the object's container if it's not directly inside a room, null otherwise
+	final boolean isRoom() - returns true if the container is a room (the only kind of container that has no parent container)
+	final boolean isDirectlyInRoom() - returns true if the object is placed directly in a room
+	final Room room() - returns the room the object is ultimately in (or itself, if it's a room)
+	final boolean contains(Active obj) - whether or not this object contains the given one directly
+	final boolean containsDeep() - whether or not this object contains the given one recursively
+	final boolean commonContainer(Active obj) - returns the nearest 'ancestor' of both containers, or null if there is none
+	
+A	double availableSize() - current maximum size for a new object being added to this one
+A	double lengthLimit() - current maximum limit on the length of items in this one
+A	double widthLimit() - current maximum limit on the width of items in this one
+A	double size() - the volume of this object
+A	double weight() - the weight of this object
+pr	final void updateSize() - updates this object's size
+pr	final void updateWeight() - update this object's weight
+	
+	final double contentSize() - the total size of the object's contents
+	final double contentWeight() - the total weight of the object's contents
+Opr	void onContentWeightChanged() - called when the weight of this object's contents changes
+	final double longestContent() - length of longest content
+	final double widestContent() - the width of the widest content
+Xpr	final void updateLongestContent() - recalculates the longest content (only needed by Active class)
+Xpr	final void updateLongestContent(Active obj) - same as above, but only looking at a specific object
+Xpr	final void updateWidestContent() - recalculates the widest content (only needed by Active class)
+Xpr	final void updateWidestContent(Active obj) - same as above, but only looking at a specific object
+	
+	final boolean canFit(Active obj, Report r) - tests whether the given object can fit in this one, reporting failure
+	final boolean canFit(Active obj) - tests whether the given object can fit in this one without reporting
+	final boolean add(Active obj, Active actor, Report r) - attempts to add obj to this object's contents, with actor as the acting party, with reporting. returns true only on success
+	final boolean remove(Active obj, Active actor, Report r) - attempts to remove obj from this container into this object's container (or destroys it if this object is a room); actor is the acting party, with reporting
+Opr	boolean authorizeAdd(Active obj, Active actor, Report r) - checks to see whether it's okay to add the given object to this one
+Opr	boolean authorizeRemove(Active obj, Container moveTo, Active actor, Report r) - checks to see whether it's okay to take the given object from this one and put it in moveTo
+Opr	void onAdd(Active obj, Active actor) - called when an object is added to this one
+Opr	onRemove(Active obj, Container moveTo, Active actor) - called when obj is removed from this object and put in moveTo by actor
