@@ -3,6 +3,7 @@ package widders.util;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 
+
 /**
  * Provides tools to create iterators that traverse over all the elements in a
  * set of sub-iterators, either from an array or iterator of iterators, or from
@@ -52,8 +53,10 @@ public abstract class MultiIterator<E> implements Iterator<E> {
   }
   
   public final E next() {
-    if (!advanced) advance();
-    if (complete) throw new NoSuchElementException("No more elements");
+    if (!advanced)
+      advance();
+    if (complete)
+      throw new NoSuchElementException("No more elements");
     
     lastGot = getHere;
     advanced = false; //after calling next(), will no longer be current
@@ -65,100 +68,103 @@ public abstract class MultiIterator<E> implements Iterator<E> {
       throw new IllegalStateException("Iterator not yet incremented");
     lastGot.remove();
   }
-}
   
   
-class IterableArrayIterator<E> extends MultiIterator<E> {
-  private Iterable<E>[] internal;
-  private int position = 0;
-  
-  IterableArrayIterator(Iterable<E>[] iterables) {
-    internal = iterables;
-  }
-  
-  @Override
-  protected void advance() {
-    if (complete) return;
+  private static class IterableArrayIterator<E> extends MultiIterator<E> {
+    private Iterable<E>[] internal;
+    private int position = 0;
     
-    while (getHere == null || !getHere.hasNext()) {
-      if (++position == internal.length) {
-        complete = true; //advanced past end of array
-        return;
-      }
-      Iterable<E> x = internal[position];
-      if (x != null) getHere = x.iterator();
+    IterableArrayIterator(Iterable<E>[] iterables) {
+      internal = iterables;
     }
-  }
-}
-
-
-
-class IteratorArrayIterator<E> extends MultiIterator<E> {
-  private Iterator<E>[] internal;
-  private int position = 0;
-  
-  IteratorArrayIterator(Iterator<E>[] iterators) {
-    internal = iterators;
-  }
-  
-  @Override
-  protected void advance() {
-    if (complete) return;
     
-    while (getHere == null || !getHere.hasNext()) {
-      if (++position == internal.length) {
-        complete = true; //advanced past end of array
+    @Override
+    protected void advance() {
+      if (complete)
         return;
-      }
-      getHere = internal[position];
-    }
-  }
-}
-
-
-
-class IterableIteratorIterator<E> extends MultiIterator<E> {
-  private Iterator<? extends Iterable<E>> internal;
-  
-  IterableIteratorIterator(Iterator<? extends Iterable<E>> iterables) {
-    internal = iterables;
-  }
-  
-  @Override
-  protected void advance() {
-    if (complete) return;
-    
-    while (getHere == null || !getHere.hasNext()) {
-      if (internal.hasNext()) {
-        Iterable<E> x = internal.next();
-        if (x != null) getHere = x.iterator();
-      } else {
-        complete = true;
-        return;
+      
+      while (getHere == null || !getHere.hasNext()) {
+        if (++position == internal.length) {
+          complete = true; //advanced past end of array
+          return;
+        }
+        Iterable<E> x = internal[position];
+        if (x != null)
+          getHere = x.iterator();
       }
     }
   }
-}
-
-
-
-class IteratorIteratorIterator<E> extends MultiIterator<E> {
-  private Iterator<? extends Iterator<E>> internal;
   
-  IteratorIteratorIterator(Iterator<? extends Iterator<E>> iterators) {
-    internal = iterators;
+  
+  private static class IteratorArrayIterator<E> extends MultiIterator<E> {
+    private Iterator<E>[] internal;
+    private int position = 0;
+    
+    IteratorArrayIterator(Iterator<E>[] iterators) {
+      internal = iterators;
+    }
+    
+    @Override
+    protected void advance() {
+      if (complete)
+        return;
+      
+      while (getHere == null || !getHere.hasNext()) {
+        if (++position == internal.length) {
+          complete = true; //advanced past end of array
+          return;
+        }
+        getHere = internal[position];
+      }
+    }
   }
   
-  @Override
-  protected void advance() {
-    if (complete) return;
+  
+  private static class IterableIteratorIterator<E> extends MultiIterator<E> {
+    private Iterator<? extends Iterable<E>> internal;
     
-    while (getHere == null || !getHere.hasNext()) {
-      if (internal.hasNext()) {
-        getHere = internal.next();
-      } else {
-        complete = true;
+    IterableIteratorIterator(Iterator<? extends Iterable<E>> iterables) {
+      internal = iterables;
+    }
+    
+    @Override
+    protected void advance() {
+      if (complete)
         return;
+      
+      while (getHere == null || !getHere.hasNext()) {
+        if (internal.hasNext()) {
+          Iterable<E> x = internal.next();
+          if (x != null)
+            getHere = x.iterator();
+        } else {
+          complete = true;
+          return;
+        }
+      }
+    }
+  }
+  
+  
+  private static class IteratorIteratorIterator<E> extends MultiIterator<E> {
+    private Iterator<? extends Iterator<E>> internal;
+    
+    IteratorIteratorIterator(Iterator<? extends Iterator<E>> iterators) {
+      internal = iterators;
+    }
+    
+    @Override
+    protected void advance() {
+      if (complete)
+        return;
+      
+      while (getHere == null || !getHere.hasNext()) {
+        if (internal.hasNext()) {
+          getHere = internal.next();
+        } else {
+          complete = true;
+          return;
+        }
       }
     }
   }
