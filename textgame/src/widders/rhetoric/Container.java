@@ -139,7 +139,9 @@ public abstract class Container implements Named, Iterable<Active> {
     if (spawnHere == null && !(this instanceof Room))
       throw new Error("Only Rooms may init() without a container");
     container = spawnHere;
-    this.preposition = preposition.intern();
+    this.preposition = preposition == null
+        ? null
+        : preposition.intern();
     this.name = name;
     internalName = name + "~" + iD;
     registry.put(internalName, this);
