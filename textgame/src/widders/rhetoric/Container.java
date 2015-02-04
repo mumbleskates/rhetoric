@@ -47,7 +47,7 @@ public abstract class Container implements Named, Iterable<Active> {
   private String internalName;
   
   // force recompute size/weight totals at least after this many removals
-  private static final int RECOMPUTE_INTERVAL = 512;
+  private static final int RECOMPUTE_INTERVAL = 1 << 12;
   /* force recompute size/weight totals if the magnitude falls below this ratio
    * of its peak. */
   private static final double RECOMPUTE_PEAK_RATIO = 1d / (1L << 32);
@@ -572,7 +572,7 @@ public abstract class Container implements Named, Iterable<Active> {
         contentWeight += deltaWeight;
         if (contentWeightRecompute == 0
             || Math.abs(contentWeight) <
-            Math.abs(contentWeightPeak) * RECOMPUTE_PEAK_RATIO) {
+            contentWeightPeak * RECOMPUTE_PEAK_RATIO) {
           recomputeContentWeight();
         } else {
           contentWeightRecompute--;
@@ -580,7 +580,7 @@ public abstract class Container implements Named, Iterable<Active> {
       } else {
         // magnitude of weight is being increased, no worries mate
         contentWeight += deltaWeight;
-        contentWeightPeak = Math.max(contentWeight, contentWeightPeak);
+        contentWeightPeak = Math.max(Math.abs(contentWeight), contentWeightPeak);
       }
       updateWeight();
       if (contentWeight != oldWeight)
@@ -806,6 +806,8 @@ public abstract class Container implements Named, Iterable<Active> {
     updateWidestContentIncrease(width);
   }
   
+  ///// TODO onContentWeightChanged etc. events shouldn't be called twice if a container containsdeep an object that's being moved...
+  ///// TODO do you really need these dimensions or can you use lastReportedWeight etc.? there's no way they're really needed...
   private static void enactRemove(Active obj, double size, double weight,
                                   double length, double width) {
     Container from = ((Container)obj).container;

@@ -42,7 +42,6 @@ public final class Chronology extends Active {
     return scheduler.schedule(task, delayMs, TimeUnit.MILLISECONDS);
   }
 
-  ///// TODO implement task queueing
   public ScheduledFuture<?> scheduleTask(long delayMs, final Active actor,
                                      final String verb,
                                      final Active target, final Report report) {
