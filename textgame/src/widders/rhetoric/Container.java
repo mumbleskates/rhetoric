@@ -56,31 +56,22 @@ public abstract class Container implements Named, Iterable<Active> {
   private static final int SHRINK_FACTOR = 4;
   private static final int COMFORTABLE_CAPACITY = 64;
   
-  // locks to enforce synchronicity on dimension tracking
-  // god i hope this works
-  private Object sizeLock = new Object();
-  private Object weightLock = new Object();
-  private Object lengthLock = new Object();
-  private Object widthLock = new Object();
   
+  // lock to enforce synchronicity on dimension tracking
+  private Object synchro = new Object();
+  
+  // These are only updated in the context of both this object's and its container's synchro
   private double lastReportedSize;
   private double lastReportedWeight;
   private double lastReportedLength;
   private double lastReportedWidth;
   
-  /*  These are set to volatile because a change in one of these, by process, can
-   *  trigger reads of the corresponding values in cousin objects. If two objects
-   *  in the same room were to request changes at the same time in different threads,
-   *  it is strictly necessary to avoid requesting a lock on-read to avoid deadlocks.
-   *  Volatile guarantees that 64 bit primitives can be read whole and thread-safe
-   *  without cutting the values in half if it is being written by another thread.
-   *  
-   *  Every instance in which these are written is synchronized to the corresponding
-   *  lock. */
-  private volatile double contentSize = 0d; // total size of contents
-  private volatile double contentWeight = 0d; // total weight of contents
-  private volatile double longestContent = 0d; // length of longest content
-  private volatile double widestContent = 0d; // width of widest content
+  /* Every instance in which these are accessed is synchronized to this object's synchro */
+  private double contentSize = 0d; // total size of contents
+  private double contentWeight = 0d; // total weight of contents
+  private double longestContent = 0d; // length of longest content
+  private double widestContent = 0d; // width of widest content
+  //private int contentCountDeep = 0; // recursive count of contents
   
   // number of size reductions since recomputing
   private int contentSizeRecompute = RECOMPUTE_INTERVAL;
@@ -96,19 +87,20 @@ public abstract class Container implements Named, Iterable<Active> {
   
   /**
    * Simple preposition that indicates the relationship to this object's
-   * container. Interned before set; comparing the actual property can use == operator
+   * container. Interned before set; comparing the actual property can use ==
+   * operator
    */
   private String preposition;
   
   /** The contents of this container */
   private RandomAccessLinkedHashSet<Active> contents =
       new RandomAccessLinkedHashSet<Active>();
-      //new LinkedHashSet<Active>();
+  //new LinkedHashSet<Active>();
   private int contentCountPeak;
   
   /**
    * The dates at which the object is created and incinerated, for gc
-   * statistics
+   * statistics; based on actual real-life time, not game time
    */
   @SuppressWarnings("unused")
   private long dateCreated = System.currentTimeMillis();
@@ -116,7 +108,7 @@ public abstract class Container implements Named, Iterable<Active> {
   private long dateDoomed = Long.MIN_VALUE;
   
   /** Set to true when the object has finished initializing. */
-  private boolean initialized = false;
+  private volatile boolean initialized = false;
   
   /** The ID allocator counter */
   private static long nextID = 0;
@@ -156,16 +148,16 @@ public abstract class Container implements Named, Iterable<Active> {
    * 
    * @throws DoesNotFitException
    */
-  public final synchronized void init() throws DoesNotFitException {
+  public final void init() throws DoesNotFitException {
     if (initialized)
       return;
     if (!(this instanceof Active))
       throw new Error("Only Active objects should be initialized with init()");
     
-    lastReportedSize = size();
-    lastReportedWeight = weight();
-    lastReportedLength = length();
-    lastReportedWidth = width();
+      lastReportedSize = size();
+      lastReportedWeight = weight();
+      lastReportedLength = length();
+      lastReportedWidth = width();
     
     Report r = new Report();
     if (!container.emplace((Active)this, preposition, Main.creator, r)) {
@@ -277,7 +269,7 @@ public abstract class Container implements Named, Iterable<Active> {
   }
   
   /** Returns the number of items contained recursively */
-  public final synchronized int contentCountDeep() {
+  public final int contentCountDeep() {
     int t;
     t = contents.size();
     for (Active content : contents) {
@@ -364,108 +356,302 @@ public abstract class Container implements Named, Iterable<Active> {
   /** Returns the size of the container object */
   public abstract double size();
   
-  /** Returns the weight of the container object. */
+  /** Returns the weight of the container object */
   public abstract double weight();
   
-  /** The length of the object along its longest axis */
+  /** Returns the length of the object along its longest axis */
   public abstract double length();
   
-  /**
-   * The width of the object: the largest square/circular opening
-   * it can fit through
-   */
+  /** Returns the width of the object */
   public abstract double width();
   
+  /** Updates this object's size, weight, etc. */
+  protected final void updateStats() {
+    if (!initialized)
+      return;
+    
+    boolean changeSize, changeWeight, changeLength, changeWidth;
+    
+    synchronized (synchro) {
+      double newSize = size();
+      double newWeight = weight();
+      double newLength = length();
+      double newWidth = width();
+      
+      // parameters to send to changeStats
+      double sendSize, sendWeight, sendLength, sendWidth;
+      
+      changeSize = newSize != lastReportedSize;
+      changeWeight = newWeight != lastReportedWeight;
+      changeLength = newLength != lastReportedLength;
+      changeWidth = newWidth != lastReportedWidth;
+      
+      if (changeSize || changeWeight || changeLength || changeWidth) {
+        // synchronize upwards only
+        synchronized (container.synchro) { // synchronize moving upwards only (bottleneck)
+          // size
+          if (changeSize) {
+            sendSize = newSize - lastReportedSize;
+            lastReportedSize = newSize;
+          } else {
+            sendSize = 0d; // no change signal
+          }
+          
+          // weight
+          if (changeWeight) {
+            sendWeight = newWeight - lastReportedWeight;
+            lastReportedWeight = newWeight;
+          } else {
+            sendWeight = 0d; // no change signal
+          }
+          
+          // length
+          if (changeLength) {
+            if (newLength < lastReportedLength) {
+              // if this could be the container's longest object, propagate upwards
+              if (lastReportedLength == container.longestContent)
+                sendLength = -1d; // reduce signal
+              else
+                sendLength = 0d; // no change signal
+            } else /* if (newLength > lastReportedLength) */{
+              sendLength = newLength; // increase signal
+            }
+            lastReportedLength = newLength;
+          } else {
+            sendLength = 0d; // no change signal
+          }
+          
+          // width
+          if (changeWidth) {
+            if (newWidth < lastReportedWidth) {
+              // if this could be the container's longest object, propagate upwards
+              if (lastReportedWidth == container.widestContent)
+                sendWidth = -1d; // reduce signal
+              else
+                sendWidth = 0d; // no change signal
+            } else /* if (newLength > lastReportedLength) */{
+              sendWidth = newWidth; // increase signal
+            }
+            lastReportedWidth = newWidth;
+          } else {
+            sendWidth = 0d; // no change signal
+          }
+          
+          container.changeContentStats(sendSize, sendWeight, sendLength, sendWidth);
+        }
+      }
+    }
+  }
+  
+  /** Changes the content size, weight, length etc. */
+  private void changeContentStats(double sizeDelta, double weightDelta, double lengthChange, double widthChange) {
+    boolean changed = false;
+    
+    // size
+    if (sizeDelta != 0d) {
+      changed = true;
+      contentSize += sizeDelta; // modify size
+      
+      if (sizeDelta < 0d) {
+        // magnitude of weight is being reduced (size is always non-negative)
+        // If there have been enough reductions to trigger a recompute,
+        // or the size has been reduced enough from its maximum... 
+        if (contentSizeRecompute == 0
+            || contentSize < contentSizePeak * RECOMPUTE_PEAK_RATIO) {
+          // recompute size
+          contentSizeRecompute = RECOMPUTE_INTERVAL;
+          contentSize = 0d;
+          for (Container content : contents) {
+            contentSize += content.lastReportedSize;
+          }
+          contentSizePeak = contentSize;
+        } else {
+          contentSizeRecompute--;
+        }
+      } else {
+        contentSizePeak = Math.max(contentSize, contentSizePeak);
+      }
+    }
+    
+    // weight
+    if (weightDelta != 0d) {
+      changed = true;
+      double oldWeight = contentWeight;
+      
+      contentWeight += weightDelta;
+      
+      //check for recomputes
+      if (Math.abs(contentWeight) < Math.abs(oldWeight)) {
+        if (contentWeightRecompute == 0
+            || Math.abs(contentWeight) <
+            contentWeightPeak * RECOMPUTE_PEAK_RATIO) {
+          // recompute content weight
+          contentWeightRecompute = RECOMPUTE_INTERVAL;
+          contentWeight = 0d;
+          for (Container content : contents) {
+            contentWeight += content.lastReportedWeight;
+          }
+          contentWeightPeak = contentWeight;
+        } else {
+          // count down to mandatory recompute
+          contentWeightRecompute--;
+        }
+      } else {
+        // magnitude of weight is being increased, no worries mate
+        contentWeightPeak =
+            Math.max(Math.abs(contentWeight), contentWeightPeak);
+      }
+    }
+    
+    // length
+    if (lengthChange != 0d) {
+      changed = true;
+      if (lengthChange > 0d) { // content increased in length
+        longestContent = Math.max(longestContent, lengthChange);
+      } else if (lengthChange < 0d) { // content decreased in length
+        double newLongest = 0d;
+        for (Container content : contents) {
+          double len = content.lastReportedLength;
+          if (len == longestContent) break;
+          newLongest = Math.max(newLongest, len);
+        }
+        longestContent = newLongest;
+      }
+    }
+    
+    // width
+    if (widthChange != 0d) {
+      changed = true;
+      if (widthChange > 0d) { // content increased in length
+        widestContent = Math.max(widestContent, widthChange);
+      } else if (widthChange < 0d) { // content decreased in length
+        double newWidest = 0d;
+        for (Container content : contents) {
+          double wide = content.lastReportedWidth;
+          if (wide == widestContent) break;
+          newWidest = Math.max(newWidest, wide);
+        }
+        widestContent = newWidest;
+      }
+    }
+    
+    // now update this object and so forth
+    if (changed) updateStats();
+  }
+  
+  @Deprecated
   /** Updates this object's size */
   protected final void updateSize() {
     if (!initialized)
       return;
     
-    synchronized (sizeLock) {
+    synchronized (synchro) {
       double newSize = size();
       if (newSize != lastReportedSize) {
-        container.changeContentSize(newSize - lastReportedSize);
-        lastReportedSize = newSize;
+        // synchronize upwards only
+        synchronized (container.synchro) { ///// TODO synchro check
+          lastReportedSize = newSize;
+          container.changeContentSize(newSize - lastReportedSize);
+        }
       }
     }
   }
   
+  @Deprecated
   /** Updates this object's weight */
   protected final void updateWeight() {
     if (!initialized)
       return;
     
-    synchronized (weightLock) {
+    synchronized (synchro) {
       double newWeight = weight();
       if (newWeight != lastReportedWeight) {
-        container.changeContentWeight(newWeight - lastReportedWeight);
-        lastReportedWeight = newWeight;
+        synchronized (container.synchro) { ///// TODO synchro check
+          lastReportedWeight = newWeight;
+          container.changeContentWeight(newWeight - lastReportedWeight);
+        }
       }
     }
   }
   
+  @Deprecated
   protected final void updateLength() {
     if (!initialized)
       return;
     
-    synchronized (lengthLock) {
+    synchronized (synchro) {
       double newLength = length();
       if (newLength == lastReportedLength)
         return;
-      if (newLength < lastReportedLength) {
+      
+      synchronized (container.synchro) { ///// TODO synchro check
         lastReportedLength = newLength;
-        // if this could be the container's longest object, propagate upwards
-        if (lastReportedLength == container.longestContent)
-          container.updateLongestContentReduce();
-      } else /* if (newLength > lastReportedLength) */{
-        lastReportedLength = newLength;
-        container.updateLongestContentIncrease(newLength);
+        
+        if (newLength < lastReportedLength) {
+          // if this could be the container's longest object, propagate upwards
+          if (lastReportedLength == container.longestContent)
+            container.updateLongestContentReduce();
+        } else /* if (newLength > lastReportedLength) */{
+          container.updateLongestContentIncrease(newLength);
+        }
       }
     }
     
-    onContentLengthChanged();
+    onContentLengthChanged(); ///// TODO this doesn't seem right
   }
   
+  @Deprecated
   protected final void updateWidth() {
     if (!initialized)
       return;
     
-    synchronized (widthLock) {
+    synchronized (synchro) {
       double newWidth = width();
       if (newWidth == lastReportedWidth)
         return;
-      if (newWidth < lastReportedWidth) {
+      synchronized (container.synchro) { ///// TODO synchro check
         lastReportedWidth = newWidth;
-        // if this could be the container's widest content, propagate upwards
-        if (lastReportedWidth == container.widestContent)
-          container.updateWidestContentReduce();
-      } else /* if (newWidth > lastReportedWidth) */{
-        lastReportedWidth = newWidth;
-        container.updateWidestContentIncrease(newWidth);
+        
+        if (newWidth < lastReportedWidth) {
+          // if this could be the container's widest content, propagate upwards
+          if (lastReportedWidth == container.widestContent)
+            container.updateWidestContentReduce();
+        } else /* if (newWidth > lastReportedWidth) */{
+          lastReportedWidth = newWidth;
+          container.updateWidestContentIncrease(newWidth);
+        }
       }
     }
     
-    onContentWidthChanged();
+    onContentWidthChanged(); ///// TODO this doesn't seem right
   }
   
   /** Returns the total size of the contents */
   public final double contentSize() {
-    return contentSize;
+    synchronized (synchro) {
+      return contentSize;
+    }
   }
   
   /** Returns the total weight of the contents */
   public final double contentWeight() {
-    return contentWeight;
+    synchronized (synchro) {
+      return contentWeight;
+    }
   }
   
   /** Returns the length of the longest contained item */
   public final double longestContent() {
-    return longestContent;
+    synchronized (synchro) {
+      return longestContent;
+    }
   }
   
   /** Returns the width of the widest contained item */
   public final double widestContent() {
-    return widestContent;
+    synchronized (synchro) {
+      return widestContent;
+    }
   }
   
   /**
@@ -504,6 +690,7 @@ public abstract class Container implements Named, Iterable<Active> {
   protected void onContentWidthChanged() {
   }
   
+  @Deprecated
   /**
    * Modifies the tallied total content size without necessarily recomputing.
    * Negative object sizes are not supported!
@@ -516,11 +703,13 @@ public abstract class Container implements Named, Iterable<Active> {
     if (deltaSize == 0d)
       return;
     
-    synchronized (sizeLock) {
+    synchronized (synchro) {
       double oldSize = contentSize;
+      
+      contentSize += deltaSize; // modify size
+      
       if (deltaSize < 0) {
         // magnitude of weight is being reduced (size is always non-negative)
-        contentSize += deltaSize; // modify size
         if (contentSizeRecompute == 0
             || contentSize < contentSizePeak * RECOMPUTE_PEAK_RATIO) {
           recomputeContentSize();
@@ -528,7 +717,6 @@ public abstract class Container implements Named, Iterable<Active> {
           contentSizeRecompute--;
         }
       } else {
-        contentSize += deltaSize;
         contentSizePeak = Math.max(contentSize, contentSizePeak);
       }
       updateSize();
@@ -537,10 +725,10 @@ public abstract class Container implements Named, Iterable<Active> {
     }
   }
   
+  @Deprecated
   /**
-   * Updates the size of this container's contents. Only Active should
-   * ever need to call this method.
-   * 
+   * Updates the size of this container's contents. 
+   *  
    * Only called from synchronized context
    */
   private void recomputeContentSize() {
@@ -549,10 +737,10 @@ public abstract class Container implements Named, Iterable<Active> {
     for (Active content : contents) {
       x += content.size();
     }
-    contentSize = x;
-    contentSizePeak = x;
+    contentSizePeak = contentSize = x;
   }
   
+  @Deprecated
   /**
    * Modifies the tallied total content weight without necessarily recomputing.
    * Supports negative weight.
@@ -565,11 +753,13 @@ public abstract class Container implements Named, Iterable<Active> {
     if (deltaWeight == 0d)
       return;
     
-    synchronized (weightLock) {
+    synchronized (synchro) {
       double oldWeight = contentWeight;
-      if (Math.signum(deltaWeight) != Math.signum(contentWeight)) {
+      
+      contentWeight += deltaWeight;
+      
+      if (Math.abs(contentWeight) < Math.abs(oldWeight)) {
         // magnitude of weight is being reduced
-        contentWeight += deltaWeight;
         if (contentWeightRecompute == 0
             || Math.abs(contentWeight) <
             contentWeightPeak * RECOMPUTE_PEAK_RATIO) {
@@ -579,8 +769,8 @@ public abstract class Container implements Named, Iterable<Active> {
         }
       } else {
         // magnitude of weight is being increased, no worries mate
-        contentWeight += deltaWeight;
-        contentWeightPeak = Math.max(Math.abs(contentWeight), contentWeightPeak);
+        contentWeightPeak =
+            Math.max(Math.abs(contentWeight), contentWeightPeak);
       }
       updateWeight();
       if (contentWeight != oldWeight)
@@ -588,6 +778,7 @@ public abstract class Container implements Named, Iterable<Active> {
     }
   }
   
+  @Deprecated
   /**
    * Updates the weight of this container's contents.
    * 
@@ -596,16 +787,16 @@ public abstract class Container implements Named, Iterable<Active> {
   private void recomputeContentWeight() {
     contentWeightRecompute = RECOMPUTE_INTERVAL;
     double newWeight = 0d;
-    for (Active content : contents) {
-      newWeight += content.weight();
+    for (Container content : contents) {
+      newWeight += content.lastReportedWeight;
     }
-    contentWeight = newWeight;
-    contentWeightPeak = newWeight;
+    contentWeightPeak = contentWeight = newWeight;
   }
   
+  @Deprecated
   /** Only called from synchronized context */
   private void updateLongestContentIncrease(double length) {
-    synchronized (lengthLock) {
+    synchronized (synchro) {
       if (length > longestContent) {
         longestContent = length;
         updateLength();
@@ -613,6 +804,7 @@ public abstract class Container implements Named, Iterable<Active> {
     }
   }
   
+  @Deprecated
   /**
    * updates the length on object's removal with knowledge of the old length
    * 
@@ -620,7 +812,7 @@ public abstract class Container implements Named, Iterable<Active> {
    */
   private void updateLongestContentReduce() {
     double longest = 0d;
-    synchronized (lengthLock) {
+    synchronized (synchro) {
       for (Active content : contents) {
         double len = content.length();
         if (len == longestContent)
@@ -632,9 +824,10 @@ public abstract class Container implements Named, Iterable<Active> {
     updateLength();
   }
   
+  @Deprecated
   /** Only called from synchronized context */
   private void updateWidestContentIncrease(double width) {
-    synchronized (widthLock) {
+    synchronized (synchro) {
       if (width > widestContent) {
         widestContent = width;
         updateWidth();
@@ -642,6 +835,7 @@ public abstract class Container implements Named, Iterable<Active> {
     }
   }
   
+  @Deprecated
   /**
    * updates the width on object's removal with knowledge of the old width
    * 
@@ -649,7 +843,7 @@ public abstract class Container implements Named, Iterable<Active> {
    */
   private void updateWidestContentReduce() {
     double widest = 0d;
-    synchronized (widthLock) {
+    synchronized (synchro) {
       for (Active content : contents) {
         double width = content.width();
         if (width == widestContent)
@@ -701,7 +895,7 @@ public abstract class Container implements Named, Iterable<Active> {
         r.report("The " + obj.name().get() + " is already there.");
         return false; // already there
       } else { // here but with different preposition
-        
+      
         // shift
         if (!obj.movable()) { // mobility check
           r.report("The " + obj.name().get() + " is unmovable.");
@@ -813,6 +1007,8 @@ public abstract class Container implements Named, Iterable<Active> {
     Container from = ((Container)obj).container;
     synchronized (from) {
       if (from.contents.remove(obj)) {
+        
+        ///// TODO gotta use the new system 
         from.changeContentSize(-size);
         from.changeContentWeight(-weight);
         if (length == from.longestContent)
@@ -921,10 +1117,8 @@ public abstract class Container implements Named, Iterable<Active> {
   @Override
   protected final void finalize() throws Throwable {
     //preFinalize();
-    /*
-    Main.debug.p("finalized", toString()
-        + " / lived for " + (dateDoomed - dateCreated) + "ms"
-        + ", doomed for " + (System.currentTimeMillis() - dateDoomed) + "ms");
-     */
+    /*Main.debug.p("finalized", toString()
+     * + " / lived for " + (dateDoomed - dateCreated) + "ms"
+     * + ", doomed for " + (System.currentTimeMillis() - dateDoomed) + "ms"); */
   }
 }

@@ -236,7 +236,7 @@ public class Main {
           break;
 
         case 1:
-          v = Value.make(rand.nextInt(1) == 1);
+          v = Value.make(rand.nextInt(2) == 1);
           break;
 
         case 2:
