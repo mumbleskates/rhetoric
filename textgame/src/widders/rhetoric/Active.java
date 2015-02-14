@@ -391,6 +391,19 @@ public abstract class Active extends Container {
     notifyWatchers(actor, "move", null);
   }
   
+  /**
+   * Called when this object is shifted (changes its preposition) inside its container.
+   * Can be overridden!
+   * 
+   * @param actor
+   *          the object that caused the move
+   * @param oldPreposition
+   *          this object's previous containment preposition
+   */
+  public void onShifted(Active actor, String oldPreposition) {
+    notifyWatchers(actor, "shift", null);
+  }
+  
   /** Notifies the watching objects that an action was taken upon this object */
   private void notifyWatchers(Active actor, String verb, Active indirect) {
     if (watchers == null)

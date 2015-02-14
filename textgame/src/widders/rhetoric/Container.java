@@ -1,11 +1,17 @@
 package widders.rhetoric;
 
+import java.util.Collections;
 import java.util.Hashtable;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import widders.util.IterProtector;
 import widders.util.RandomAccessLinkedHashSet;
+import widders.util.SimpleStack;
 
 
 /**
@@ -25,13 +31,6 @@ public abstract class Container implements Named, Iterable<Active> {
   // say that they don't fit (ABSTRACT)
   // those attributes are accessible to the outside
   
-  // SOLVED: what if you add a bunch of empty bags to another identical bag,
-  // then fill up all the inside bags so that the limits are actually
-  // exceeded?
-  // PROBLEM ALREADY SOLVED (by seeding flexibleSize() from this class and using
-  // that to determine extended fitting etc.)
-  // ^ WOW that was an old problem. It's so much more beautiful now, you should see it.
-  
   // container() RETURNS AN Active, OR NULL IF THE CONTAINER IS ACTUALLY A Room
   // room() RETURNS THE ROOM THE OBJECT IS ULTIMATELY IN
   
@@ -47,7 +46,7 @@ public abstract class Container implements Named, Iterable<Active> {
   private String internalName;
   
   // force recompute size/weight totals at least after this many removals
-  private static final int RECOMPUTE_INTERVAL = 1 << 12;
+  private static final int RECOMPUTE_INTERVAL = 1 << 10;
   /* force recompute size/weight totals if the magnitude falls below this ratio
    * of its peak. */
   private static final double RECOMPUTE_PEAK_RATIO = 1d / (1L << 32);
@@ -56,21 +55,23 @@ public abstract class Container implements Named, Iterable<Active> {
   private static final int SHRINK_FACTOR = 4;
   private static final int COMFORTABLE_CAPACITY = 64;
   
+  // lock to enforce synchronicity on stats tracking
+  private final ReentrantLock statSynchro = new ReentrantLock();
   
-  // lock to enforce synchronicity on dimension tracking
-  private Object synchro = new Object();
-  
-  // These are only updated in the context of both this object's and its container's synchro
+   /* These are only updated in the context of both this object's AND its container's synchro
+   Therefore, locking your own synchro guarantees stability of the lastReported
+   values of all your contained objects */
   private double lastReportedSize;
   private double lastReportedWeight;
   private double lastReportedLength;
   private double lastReportedWidth;
   
-  /* Every instance in which these are accessed is synchronized to this object's synchro */
+  /* Synchronized to this container's synchro */
   private double contentSize = 0d; // total size of contents
   private double contentWeight = 0d; // total weight of contents
   private double longestContent = 0d; // length of longest content
   private double widestContent = 0d; // width of widest content
+  
   //private int contentCountDeep = 0; // recursive count of contents
   
   // number of size reductions since recomputing
@@ -81,6 +82,14 @@ public abstract class Container implements Named, Iterable<Active> {
   private int contentWeightRecompute = RECOMPUTE_INTERVAL;
   // magnitude of peak weight since recomputing
   private double contentWeightPeak = 0d;
+  
+  /** Lock to ensure that only one process is moving this object at a time. This lock may
+   * be held temporarily to 
+   */
+  private final ReentrantLock moveSynchro = new ReentrantLock();
+  private final Condition movableCondition = moveSynchro.newCondition();
+  // When this is 0 the object is ok to move
+  private int moveFreeze = 0;
   
   /** The object containing this container */
   private Container container;
@@ -93,10 +102,10 @@ public abstract class Container implements Named, Iterable<Active> {
   private String preposition;
   
   /** The contents of this container */
-  private RandomAccessLinkedHashSet<Active> contents =
-      new RandomAccessLinkedHashSet<Active>();
-  //new LinkedHashSet<Active>();
+  private RandomAccessLinkedHashSet<Active> contents;
+  // lazy instantiation as MOST objects will have no contents
   private int contentCountPeak;
+  //private AtomicInteger contentCountDeep = new AtomicInteger();
   
   /**
    * The dates at which the object is created and incinerated, for gc
@@ -111,9 +120,9 @@ public abstract class Container implements Named, Iterable<Active> {
   private volatile boolean initialized = false;
   
   /** The ID allocator counter */
-  private static long nextID = 0;
+  private static AtomicLong nextID = new AtomicLong();
   /** Unique ID for this Container */
-  public final long iD = nextID++;
+  public final long iD = nextID.incrementAndGet();
   
   
   /**
@@ -131,7 +140,7 @@ public abstract class Container implements Named, Iterable<Active> {
     if (spawnHere == null && !(this instanceof Room))
       throw new Error("Only Rooms may init() without a container");
     container = spawnHere;
-    this.preposition = preposition == null
+    this.preposition = (preposition == null)
         ? null
         : preposition.intern();
     this.name = name;
@@ -154,10 +163,10 @@ public abstract class Container implements Named, Iterable<Active> {
     if (!(this instanceof Active))
       throw new Error("Only Active objects should be initialized with init()");
     
-      lastReportedSize = size();
-      lastReportedWeight = weight();
-      lastReportedLength = length();
-      lastReportedWidth = width();
+    lastReportedSize = size();
+    lastReportedWeight = weight();
+    lastReportedLength = length();
+    lastReportedWidth = width();
     
     Report r = new Report();
     if (!container.emplace((Active)this, preposition, Main.creator, r)) {
@@ -184,14 +193,13 @@ public abstract class Container implements Named, Iterable<Active> {
     return initialized;
   }
   
-  /** Places the object from init() */
-  private synchronized boolean emplace(Active obj, String preposition,
-                                       Active actor, Report r) {
+  /** Places an initializing object in this one */
+  private boolean emplace(Active obj, String preposition,
+                          Active actor, Report r) {
     if (!authorizeAdd(obj, preposition, actor, r))
       return false;
     
-    enactAdd(obj, preposition, obj.size(), obj.weight(),
-             obj.length(), obj.width());
+    enactAdd(obj, preposition);
     
     r.report(obj + " was placed '" + preposition + "' " + this);
     
@@ -256,26 +264,33 @@ public abstract class Container implements Named, Iterable<Active> {
   /** Returns an iterator over the contained items */
   @Override
   public final Iterator<Active> iterator() {
-    return new IterProtector<Active>(contents.iterator());
+    return contents == null
+        ? Collections.<Active> emptyIterator()
+        : new IterProtector<Active>(contents.iterator());
   }
   
   public final Active[] allContents() {
-    return contents.toArray(new Active[contents.size()]);
+    return contents == null
+        ? new Active[0]
+        : contents.toArray(new Active[contents.size()]);
   }
   
   /** Returns the number of contained items */
   public final int contentCount() {
-    return contents.size();
+    return contents == null
+        ? 0
+        : contents.size();
   }
   
   /** Returns the number of items contained recursively */
   public final int contentCountDeep() {
-    int t;
-    t = contents.size();
-    for (Active content : contents) {
+    if (contents == null)
+      return 0;
+    int t = contents.size();
+    for (Active content : contents)
       t += content.contentCountDeep();
-    }
     return t;
+    //return contentCountDeep.get();
   }
   
   public final Container container() {
@@ -317,7 +332,7 @@ public abstract class Container implements Named, Iterable<Active> {
    * Returns true iff the given object is contained by this one or any of its
    * contents, reiteratively. Returns false for itself.
    */
-  public final boolean containsDeep(Active obj) {
+  public final boolean containsDeep(Container obj) {
     for (Container c = ((Container)obj).container; c != null; c = c.container) {
       if (c == this)
         return true;
@@ -326,18 +341,16 @@ public abstract class Container implements Named, Iterable<Active> {
   }
   
   /**
-   * Returns the deepest common container of this object and the given one, or
+   * Returns the innermost common container of this object and the given one, or
    * null if there is no common container. If they are the same object or one is
-   * a
-   * direct or recursive parent of the other, returns the outermost of the two.
+   * a direct or recursive parent of the other, returns the outermost of the
+   * two.
    */
-  public final Container commonContainer(Active obj) {
-    Container possible = this;
-    do {
+  public final Container commonContainer(Container obj) {
+    for (Container possible = this; possible != null; possible = possible.container) {
       if (possible == obj || possible.containsDeep(obj))
         return possible;
-      possible = possible.container;
-    } while (possible != null);
+    }
     return null;
   }
   
@@ -372,7 +385,8 @@ public abstract class Container implements Named, Iterable<Active> {
     
     boolean changeSize, changeWeight, changeLength, changeWidth;
     
-    synchronized (synchro) {
+    statSynchro.lock();
+    try {
       double newSize = size();
       double newWeight = weight();
       double newLength = length();
@@ -388,7 +402,9 @@ public abstract class Container implements Named, Iterable<Active> {
       
       if (changeSize || changeWeight || changeLength || changeWidth) {
         // synchronize upwards only
-        synchronized (container.synchro) { // synchronize moving upwards only (bottleneck)
+        Lock parentLock = container.statSynchro;
+        parentLock.lock();
+        try  { // synchronize moving upwards only (bottleneck)
           // size
           if (changeSize) {
             sendSize = newSize - lastReportedSize;
@@ -437,14 +453,25 @@ public abstract class Container implements Named, Iterable<Active> {
             sendWidth = 0d; // no change signal
           }
           
-          container.changeContentStats(sendSize, sendWeight, sendLength, sendWidth);
+          // propagate upwards
+          container.changeContentStats(sendSize, sendWeight, sendLength,
+                                       sendWidth);
+        } finally {
+          parentLock.unlock();
         }
       }
+    } finally {
+      statSynchro.unlock();
     }
   }
   
-  /** Changes the content size, weight, length etc. */
-  private void changeContentStats(double sizeDelta, double weightDelta, double lengthChange, double widthChange) {
+  /** Changes content size, weight etc. and immediately propagates */
+  private void changeContentStats(double sizeDelta, double weightDelta,
+                                  double lengthChange, double widthChange) {
+    // if (contents == null) return;
+    /* contents should never be null when this method is called, because in
+     * order for it to have a content that will call this, contents will have
+     * been instantiated */
     boolean changed = false;
     
     // size
@@ -505,152 +532,82 @@ public abstract class Container implements Named, Iterable<Active> {
     
     // length
     if (lengthChange != 0d) {
-      changed = true;
-      if (lengthChange > 0d) { // content increased in length
-        longestContent = Math.max(longestContent, lengthChange);
-      } else if (lengthChange < 0d) { // content decreased in length
+      if (lengthChange > longestContent) { // increased over current max
+        longestContent = lengthChange;
+        changed = true;
+      } else if (-lengthChange >= longestContent) { // decreased from current max
         double newLongest = 0d;
         for (Container content : contents) {
           double len = content.lastReportedLength;
-          if (len == longestContent) break;
+          if (len == longestContent)
+            break;
           newLongest = Math.max(newLongest, len);
         }
         longestContent = newLongest;
+        changed = true;
       }
     }
     
     // width
     if (widthChange != 0d) {
-      changed = true;
-      if (widthChange > 0d) { // content increased in length
-        widestContent = Math.max(widestContent, widthChange);
-      } else if (widthChange < 0d) { // content decreased in length
+      if (widthChange > widestContent) { // increased over current max
+        widestContent = widthChange;
+        changed = true;
+      } else if (-widthChange >= widestContent) { // decreased from current max
         double newWidest = 0d;
         for (Container content : contents) {
           double wide = content.lastReportedWidth;
-          if (wide == widestContent) break;
+          if (wide == widestContent)
+            break;
           newWidest = Math.max(newWidest, wide);
         }
         widestContent = newWidest;
+        changed = true;
       }
     }
     
     // now update this object and so forth
-    if (changed) updateStats();
-  }
-  
-  @Deprecated
-  /** Updates this object's size */
-  protected final void updateSize() {
-    if (!initialized)
-      return;
-    
-    synchronized (synchro) {
-      double newSize = size();
-      if (newSize != lastReportedSize) {
-        // synchronize upwards only
-        synchronized (container.synchro) { ///// TODO synchro check
-          lastReportedSize = newSize;
-          container.changeContentSize(newSize - lastReportedSize);
-        }
-      }
-    }
-  }
-  
-  @Deprecated
-  /** Updates this object's weight */
-  protected final void updateWeight() {
-    if (!initialized)
-      return;
-    
-    synchronized (synchro) {
-      double newWeight = weight();
-      if (newWeight != lastReportedWeight) {
-        synchronized (container.synchro) { ///// TODO synchro check
-          lastReportedWeight = newWeight;
-          container.changeContentWeight(newWeight - lastReportedWeight);
-        }
-      }
-    }
-  }
-  
-  @Deprecated
-  protected final void updateLength() {
-    if (!initialized)
-      return;
-    
-    synchronized (synchro) {
-      double newLength = length();
-      if (newLength == lastReportedLength)
-        return;
-      
-      synchronized (container.synchro) { ///// TODO synchro check
-        lastReportedLength = newLength;
-        
-        if (newLength < lastReportedLength) {
-          // if this could be the container's longest object, propagate upwards
-          if (lastReportedLength == container.longestContent)
-            container.updateLongestContentReduce();
-        } else /* if (newLength > lastReportedLength) */{
-          container.updateLongestContentIncrease(newLength);
-        }
-      }
-    }
-    
-    onContentLengthChanged(); ///// TODO this doesn't seem right
-  }
-  
-  @Deprecated
-  protected final void updateWidth() {
-    if (!initialized)
-      return;
-    
-    synchronized (synchro) {
-      double newWidth = width();
-      if (newWidth == lastReportedWidth)
-        return;
-      synchronized (container.synchro) { ///// TODO synchro check
-        lastReportedWidth = newWidth;
-        
-        if (newWidth < lastReportedWidth) {
-          // if this could be the container's widest content, propagate upwards
-          if (lastReportedWidth == container.widestContent)
-            container.updateWidestContentReduce();
-        } else /* if (newWidth > lastReportedWidth) */{
-          lastReportedWidth = newWidth;
-          container.updateWidestContentIncrease(newWidth);
-        }
-      }
-    }
-    
-    onContentWidthChanged(); ///// TODO this doesn't seem right
+    if (changed)
+      updateStats();
   }
   
   /** Returns the total size of the contents */
   public final double contentSize() {
-    synchronized (synchro) {
+    statSynchro.lock();
+    try {
       return contentSize;
+    } finally {
+      statSynchro.unlock();
     }
   }
   
   /** Returns the total weight of the contents */
   public final double contentWeight() {
-    synchronized (synchro) {
+    statSynchro.lock();
+    try {
       return contentWeight;
+    } finally {
+      statSynchro.unlock();
     }
   }
   
   /** Returns the length of the longest contained item */
   public final double longestContent() {
-    synchronized (synchro) {
+    statSynchro.lock();
+    try {
       return longestContent;
+    } finally {
+      statSynchro.unlock();
     }
   }
   
   /** Returns the width of the widest contained item */
   public final double widestContent() {
-    synchronized (synchro) {
+    statSynchro.lock();
+    try {
       return widestContent;
+    } finally {
+      statSynchro.unlock();
     }
   }
   
@@ -690,171 +647,6 @@ public abstract class Container implements Named, Iterable<Active> {
   protected void onContentWidthChanged() {
   }
   
-  @Deprecated
-  /**
-   * Modifies the tallied total content size without necessarily recomputing.
-   * Negative object sizes are not supported!
-   * 
-   * Only called from synchronized context.
-   * 
-   * @param deltaSize
-   */
-  private void changeContentSize(double deltaSize) {
-    if (deltaSize == 0d)
-      return;
-    
-    synchronized (synchro) {
-      double oldSize = contentSize;
-      
-      contentSize += deltaSize; // modify size
-      
-      if (deltaSize < 0) {
-        // magnitude of weight is being reduced (size is always non-negative)
-        if (contentSizeRecompute == 0
-            || contentSize < contentSizePeak * RECOMPUTE_PEAK_RATIO) {
-          recomputeContentSize();
-        } else {
-          contentSizeRecompute--;
-        }
-      } else {
-        contentSizePeak = Math.max(contentSize, contentSizePeak);
-      }
-      updateSize();
-      if (contentSize != oldSize)
-        onContentSizeChanged();
-    }
-  }
-  
-  @Deprecated
-  /**
-   * Updates the size of this container's contents. 
-   *  
-   * Only called from synchronized context
-   */
-  private void recomputeContentSize() {
-    contentSizeRecompute = RECOMPUTE_INTERVAL;
-    double x = 0d;
-    for (Active content : contents) {
-      x += content.size();
-    }
-    contentSizePeak = contentSize = x;
-  }
-  
-  @Deprecated
-  /**
-   * Modifies the tallied total content weight without necessarily recomputing.
-   * Supports negative weight.
-   * 
-   * Only called from synchronized context.
-   * 
-   * @param deltaWeight
-   */
-  private void changeContentWeight(double deltaWeight) {
-    if (deltaWeight == 0d)
-      return;
-    
-    synchronized (synchro) {
-      double oldWeight = contentWeight;
-      
-      contentWeight += deltaWeight;
-      
-      if (Math.abs(contentWeight) < Math.abs(oldWeight)) {
-        // magnitude of weight is being reduced
-        if (contentWeightRecompute == 0
-            || Math.abs(contentWeight) <
-            contentWeightPeak * RECOMPUTE_PEAK_RATIO) {
-          recomputeContentWeight();
-        } else {
-          contentWeightRecompute--;
-        }
-      } else {
-        // magnitude of weight is being increased, no worries mate
-        contentWeightPeak =
-            Math.max(Math.abs(contentWeight), contentWeightPeak);
-      }
-      updateWeight();
-      if (contentWeight != oldWeight)
-        onContentWeightChanged();
-    }
-  }
-  
-  @Deprecated
-  /**
-   * Updates the weight of this container's contents.
-   * 
-   * Only called from synchronized context
-   */
-  private void recomputeContentWeight() {
-    contentWeightRecompute = RECOMPUTE_INTERVAL;
-    double newWeight = 0d;
-    for (Container content : contents) {
-      newWeight += content.lastReportedWeight;
-    }
-    contentWeightPeak = contentWeight = newWeight;
-  }
-  
-  @Deprecated
-  /** Only called from synchronized context */
-  private void updateLongestContentIncrease(double length) {
-    synchronized (synchro) {
-      if (length > longestContent) {
-        longestContent = length;
-        updateLength();
-      }
-    }
-  }
-  
-  @Deprecated
-  /**
-   * updates the length on object's removal with knowledge of the old length
-   * 
-   * Only called from synchronized context
-   */
-  private void updateLongestContentReduce() {
-    double longest = 0d;
-    synchronized (synchro) {
-      for (Active content : contents) {
-        double len = content.length();
-        if (len == longestContent)
-          return;
-        longest = Math.max(longest, len);
-      }
-      longestContent = longest;
-    }
-    updateLength();
-  }
-  
-  @Deprecated
-  /** Only called from synchronized context */
-  private void updateWidestContentIncrease(double width) {
-    synchronized (synchro) {
-      if (width > widestContent) {
-        widestContent = width;
-        updateWidth();
-      }
-    }
-  }
-  
-  @Deprecated
-  /**
-   * updates the width on object's removal with knowledge of the old width
-   * 
-   * Only called from synchronized context
-   */
-  private void updateWidestContentReduce() {
-    double widest = 0d;
-    synchronized (synchro) {
-      for (Active content : contents) {
-        double width = content.width();
-        if (width == widestContent)
-          return;
-        widest = Math.max(widest, width);
-      }
-      widestContent = widest;
-      updateWidth();
-    }
-  }
-  
   /** Returns true iff the object can be fit into this container */
   public final boolean canFit(Active obj, Report r) {
     if (obj.width() > widthLimit()) { // width check
@@ -879,51 +671,135 @@ public abstract class Container implements Named, Iterable<Active> {
         && obj.size() <= availableSize());
   }
   
+  /** Prevents the object from being moved until moveUnfreeze() is called.
+   * Reentrant (4 billion times), persistent, does not block other processes. */
+  private void freezeMovement() {
+    moveSynchro.lock();
+    try {
+      moveFreeze++;
+    } finally {
+      moveSynchro.unlock();
+    }
+  }
+  
+  /** Undoes one layer of movement restriction from moveFreeze() */
+  private void unfreezeMovement() {
+    moveSynchro.lock();
+    try {
+      if (moveFreeze == 0)
+        throw new Error("unfreezeMovement() called on an already unfrozen object!");
+      
+      moveFreeze--;
+      if (moveFreeze == 0)
+        movableCondition.signal();
+    } finally {
+      moveSynchro.unlock();
+    }
+  }
+  
+  /** Prepares the object to be moved and */
+  private void beginMovement() {
+    moveSynchro.lock();
+    try {
+      while (moveFreeze != 0)
+        movableCondition.await();
+    } catch (InterruptedException e) {
+      System.out.println("Interrupted obtaining movement lock");
+      e.printStackTrace();
+    }
+  }
+  
+  private void endMovement() {
+    if (moveFreeze != 0)
+      throw new Error("Process attempted to end movement phase while object was frozen");
+    moveSynchro.unlock();
+  }
+  
   /**
    * Adds a contained object. Returns true on success
    */
-  public final synchronized boolean add(Active obj, String preposition,
-                                        Active actor, Report r) {
-    if (!obj.initializedActive()) // object is not initialized
-      throw new Error(obj + " has not been initialized");
+  public final boolean add(Active obj, String preposition,
+                           Active actor, Report r) {
+    /* Laundry list:
+     * obj must be initialized
+     * obj must not be this object or any object containing it
+     * obj must be movable
+     * from and this must authorize- remove and add
+     */
     
+    // obj must not be this object
     if (obj == this) { // self check
       r.report("You cannot put something inside itself.");
       return false; // impossible
-    } else if (contents.contains(obj)) { // pre-containment check
-      if (obj.preposition().equals(preposition)) {
-        r.report("The " + obj.name().get() + " is already there.");
-        return false; // already there
-      } else { // here but with different preposition
-      
-        // shift
-        if (!obj.movable()) { // mobility check
-          r.report("The " + obj.name().get() + " is unmovable.");
-          return false; // can't move
-        } else if (authorizeRemove(obj, this, actor, r)
-            && authorizeAdd(obj, preposition, actor, r)) { // authorization check
-          String oldPrep = obj.preposition();
-          ((Container)obj).preposition = preposition.intern();
-          
-          onShift(obj, actor, oldPrep); // notify this container
-          obj.onMoved(actor); // notify the moving object
-          return true; // hooray
-        } else {
-          return false; // not authorized
-        }
-        
-      }
-    } else if (!obj.movable()) { // mobility check
-      r.report("The " + obj.name().get() + " is unmovable.");
-      return false; // can't move
     }
     
-    if (obj.container().authorizeRemove(obj, this, actor, r)
-        && authorizeAdd(obj, preposition, actor, r)) { // authorization check
-      enactMove(obj, preposition, actor);
-      return true; // hooray
-    } else {
-      return false; // not authorized
+    // obj must be initialized
+    if (!obj.initializedActive())
+      throw new Error(obj + " has not been initialized");
+    
+    // list of objects frozen
+    SimpleStack<Container> frozen = new SimpleStack<Container>();
+    
+    // freeze obj for checks
+    ((Container)obj).beginMovement();
+    try {
+      
+      // obj is already here
+      if (obj.container() == this) { // pre-containment check
+        if (obj.preposition().equals(preposition)) {
+          r.report("The " + obj.name().get() + " is already there.");
+          return false; // already there
+        } else { // here but with different preposition
+        
+          // shift the object inside this one instead of moving it in the tree
+          if (!obj.movable()) { // mobility check
+            r.report("The " + obj.name().get() + " is unmovable.");
+            return false; // can't move
+          } else if (authorizeRemove(obj, this, actor, r)
+              && authorizeAdd(obj, preposition, actor, r)) { // authorization check
+            enactShift(obj, preposition, actor);
+            return true; // hooray
+          } else {
+            return false; // not authorized
+          }
+          
+        }
+      }
+      
+      // obj must be movable
+      if (!obj.movable()) { // mobility check
+        r.report("The " + obj.name().get() + " is unmovable.");
+        return false; // can't move
+      }
+      
+      // obj must not in any way contain this
+      Container c = this;
+      do {
+        frozen.push(c);
+        c.freezeMovement();
+        if (c.container == obj) {
+          r.report("You cannot put an object inside itself");
+          return false;
+        }
+        c = c.container;
+      } while (c != null);
+      
+      // obj's current container must authorize the removal
+      // this container must authorize its addition
+      if (obj.container().authorizeRemove(obj, this, actor, r)
+          && authorizeAdd(obj, preposition, actor, r)) { // authorization check
+        enactMove(obj, preposition, actor);
+        return true; // hooray
+      } else {
+        return false; // not authorized
+      }
+    } finally {
+      // end the movement phase for obj
+      ((Container)obj).endMovement();
+      
+      // unfreeze movement of critical objects
+      while (!frozen.isEmpty())
+        frozen.pop().unfreezeMovement();
     }
   }
   
@@ -946,82 +822,95 @@ public abstract class Container implements Named, Iterable<Active> {
   }
   
   /** Destroys this object. */
-  public final synchronized void destroy(Active actor) {
-    Active[] contentArray = contents.toArray(new Active[contents.size()]);
-    for (Active a : contentArray)
-      // destroy contents first
-      a.destroy(actor);
-    if (container != null)
-      enactRemove((Active)this, size(), weight(), length(), width());
-    container = null;
-    registry.remove(internalName);
-    dateDoomed = System.currentTimeMillis();
-    onDestroyed(actor);
+  public final void destroy(Active actor) {
+    statSynchro.lock();
+    try {
+      Active[] contentArray = allContents();
+      for (Active a : contentArray)
+        // destroy contents first
+        a.destroy(actor);
+      if (container != null) {
+        enactRemove((Active)this);
+      }
+      container = null;
+      registry.remove(internalName);
+      dateDoomed = System.currentTimeMillis();
+      onDestroyed(actor);
+    } finally {
+      statSynchro.unlock();
+    }
     
     Main.logger.p("destruction", this + " was incinerated by " + actor);
   }
   
   /**
    * Moves the given object into this container
-   * 
-   * Only called from synchronized context
    */
-  private void enactMove(Active obj, String preposition, Active actor) {
-    double size = obj.size(), weight = obj.weight(), length = obj.length(), width =
-        obj.width();
+  private void enactMove(Active obj, String prep, Active actor) {
+    Container from;
     
-    // REMOVE FROM OLD CONTAINER
-    enactRemove(obj, size, weight, length, width);
-    
-    obj.container().onRemove(obj, this, actor); // notify source
-    
-    // ADD TO NEW CONTAINER
-    enactAdd(obj, preposition, size, weight, length, width);
+    ((Container)obj).statSynchro.lock();
+    try {
+      from = obj.container();
+      from.statSynchro.lock();
+      try {
+        enactRemove(obj);
+      } finally {
+        from.statSynchro.unlock();
+      }
+      enactAdd(obj, prep);
+    } finally {
+      ((Container)obj).statSynchro.unlock();
+    }
     
     Main.logger.p("movement", obj + " was moved to " + this + " by " + actor);
-    onAdd(obj, actor); // notify destination
+    from.onRemove(obj, this, actor); // notify source    
+    this.onAdd(obj, actor); // notify destination
     obj.onMoved(actor); // notify moved object
   }
   
-  /** Only called from synchronized context */
-  private void enactAdd(Active obj, String preposition,
-                        double size, double weight,
-                        double length, double width) {
+  /**
+   * Concurrency v2 enactAdd method.
+   * adds to this container unconditionally and propagates stats
+   */
+  private void enactAdd(Active obj, String prep) {
     if (this instanceof Active && !initialized)
       throw new Error(this + " has not been initialized");
     
-    ((Container)obj).container = this;
-    ((Container)obj).preposition = preposition.intern();
-    this.contents.add(obj);
-    this.contentCountPeak = Math.max(contents.size(), this.contentCountPeak);
-    changeContentSize(size);
-    changeContentWeight(weight);
-    updateLongestContentIncrease(length);
-    updateWidestContentIncrease(width);
+    synchronized (statSynchro) {
+      ((Container)obj).container = this;
+      ((Container)obj).preposition = prep;
+      if (contents == null) // lazy initialization
+        contents = new RandomAccessLinkedHashSet<Active>();
+      contents.add(obj);
+      contentCountPeak = Math.max(contents.size(), contentCountPeak);
+      
+      changeContentStats(obj.size(), obj.weight(), obj.length(), obj.width());
+    }
   }
   
-  ///// TODO onContentWeightChanged etc. events shouldn't be called twice if a container containsdeep an object that's being moved...
-  ///// TODO do you really need these dimensions or can you use lastReportedWeight etc.? there's no way they're really needed...
-  private static void enactRemove(Active obj, double size, double weight,
-                                  double length, double width) {
+  /**
+   * Concurrency v2 enactRemove method.
+   * Unconditionally removes the object from its container and propagates stats
+   */
+  private static void enactRemove(Active obj) {
     Container from = ((Container)obj).container;
-    synchronized (from) {
-      if (from.contents.remove(obj)) {
-        
-        ///// TODO gotta use the new system 
-        from.changeContentSize(-size);
-        from.changeContentWeight(-weight);
-        if (length == from.longestContent)
-          from.updateLongestContentReduce();
-        if (width == from.widestContent)
-          from.updateWidestContentReduce();
-        if (from.contentSizePeak > MAX_COMFORTABLE_CAPACITY
-            && from.contents.size() <= from.contentCountPeak >>> SHRINK_FACTOR) {
-          from.contents.shrink(COMFORTABLE_CAPACITY);
-          from.contentCountPeak = from.contents.size();
-        }
-      }
+    from.contents.remove(obj);
+    from.changeContentStats(-obj.size(), -obj.weight(), -obj.length(), -obj.width());
+    
+    if (from.contentSizePeak > MAX_COMFORTABLE_CAPACITY
+        && from.contents.size() <= from.contentCountPeak >>> SHRINK_FACTOR) {
+      from.contents.shrink(COMFORTABLE_CAPACITY);
+      from.contentCountPeak = from.contents.size();
     }
+  }
+  
+  private void enactShift(Active obj, String newPreposition, Active actor) {
+    String oldPrep = obj.preposition();
+    ((Container)obj).preposition = newPreposition.intern();
+    
+    onShift(obj, actor, oldPrep); // notify this container
+    obj.onShifted(actor, oldPrep); // notify the moving object
   }
   
   /**
@@ -1117,7 +1006,7 @@ public abstract class Container implements Named, Iterable<Active> {
   @Override
   protected final void finalize() throws Throwable {
     //preFinalize();
-    /*Main.debug.p("finalized", toString()
+    /* Main.debug.p("finalized", toString()
      * + " / lived for " + (dateDoomed - dateCreated) + "ms"
      * + ", doomed for " + (System.currentTimeMillis() - dateDoomed) + "ms"); */
   }
