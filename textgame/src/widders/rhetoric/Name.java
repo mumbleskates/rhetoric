@@ -47,7 +47,7 @@ public abstract class Name {
   
   
   @Override
-  public String toString() {
+  public final String toString() {
     return get();
   }
   

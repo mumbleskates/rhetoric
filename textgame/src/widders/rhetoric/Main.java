@@ -72,11 +72,11 @@ public class Main {
    *          the command line arguments
    */
   public static void main(String[] args) {
-    ////// PARSE ARGS ///////
+    //// PARSE ARGS ////
     
     // No args at this time
     
-    ////// STATIC INIT //////
+    //// STATIC INIT ////
     
     try {
       // Start the logger
@@ -100,13 +100,13 @@ public class Main {
                         ex);
       }
       
-      ////////// RUN //////////
+      //// RUN ////
       
       test();
     } catch (Throwable ex) {
       ex.printStackTrace();
     } finally {
-      //////// CLEANUP ////////
+      //// CLEANUP ////
       
       if (logger != null) logger.shutdown();
       else System.out.println("Logger did not instantiate");
@@ -114,8 +114,8 @@ public class Main {
     }
   }
   
+  ///// TODO add concurrency test
   static void test() {
-    testValues();
     testSPQ();
     testSets();
     testContent();
@@ -222,41 +222,8 @@ public class Main {
         + "m3 of contents)");
     log("content test", wablroom + " contains " + wablroom.contentCount()
         + " items (" + wablroom.contentCountDeep() + " total)");
+    log("content test", Container.globalQueuedTasks() + " container tasks queued");
     log("content test", "done");
-  }
-  
-  private static void testValues() {
-    Value v = null;
-    int loops = 0;
-    while(true) {
-      loops++;
-      switch(rand.nextInt(5)) {
-        case 0:
-          v = Value.make();
-          break;
-
-        case 1:
-          v = Value.make(rand.nextInt(2) == 1);
-          break;
-
-        case 2:
-          v = Value.make(rand.nextLong());
-          break;
-        
-        case 3:
-          v = Value.make(rand.nextDouble());
-          break;
-        
-        case 4:
-          v = Value.make(rand.nextInt(2) == 1 ? "yes" : "no");
-          break;
-      }
-      
-      System.out.println("Value: " + v + " (" + v.toBoolean() + ") - type: " + v.type());
-      
-      if (v.toString().equals("yes")) break;
-    }
-    System.out.println(loops + " loops");
   }
   
   static int cubeFill(Container cont, double size, int iterations) {
@@ -303,6 +270,17 @@ public class Main {
   
   /** Wraps the main debug's print method */
   public static void log(String topic, String s) {
-    logger.p(topic, s);
+    switch (topic) {
+      case "creation":
+      case "destruction":
+        return;
+      
+      default:
+        logger.p(topic, s);
+    }
+  }
+  
+  public static void log(String topic, Report r) {
+    log(topic, r.text());
   }
 }

@@ -20,6 +20,8 @@ public class SimpleStack<E> {
   
   @SuppressWarnings("unchecked")
   public E pop() {
+//    if (count == 0)
+//      throw new EmptyStackException();
     return (E)elements[--count];
   }
   
