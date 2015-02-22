@@ -18,14 +18,13 @@ public class PointyStick extends Item {
   public String des(Detail detail) {
     switch (detail) {
       case BASIC:
-        return "A pointy stick as tall as a man lies here.";
+        return "A pointy stick as tall as a man.";
      
       case DETAIL:
         return "Crude, but very pointy.";
         
       case INSIDE:
-        return "You see pretty much what you would expect on the inside of"
-            + " a stick.";
+        return "You see pretty much what you would expect on the inside of a stick.";
         
       default:
         return null;

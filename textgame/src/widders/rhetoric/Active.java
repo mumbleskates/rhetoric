@@ -301,8 +301,8 @@ public abstract class Active extends Container {
    * otherwise returns false
    */
   public final boolean target(Active actor, String verb, Report r) {
-    if (!initializedActive())
-      throw new Error(this + " has not been initialized");
+    if (!isLiveObject())
+      throw new ObjectNotLiveException(this);
     
     if (targeted(actor, verb, r)) { // notify and verify with this object
       notifyWatchers(actor, verb, null); // notify watchers
@@ -326,8 +326,8 @@ public abstract class Active extends Container {
    */
   public final boolean use(Active actor, String verb, Selection target,
                            Report r) {
-    if (!initializedActive())
-      throw new Error(this + " has not been initialized");
+    if (!isLiveObject())
+      throw new ObjectNotLiveException(this);
     
     if (used(actor, verb, target, r)) {
       for (Active a : target) {
@@ -418,8 +418,8 @@ public abstract class Active extends Container {
    * successful
    */
   public final boolean addWatcher(Active w) {
-    if (!initializedActive())
-      throw new Error(this + " has not been initialized");
+    if (!isLiveObject())
+      throw new ObjectNotLiveException(this);
     
     if (w == null || w == this)
       return false;

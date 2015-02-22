@@ -8,6 +8,7 @@ import java.io.File;
 import java.io.PrintStream;
 import java.text.*;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 
 import com.google.common.collect.testing.MinimalCollection;
 import com.google.common.collect.testing.TestStringSetGenerator;
@@ -81,7 +82,7 @@ public class Main {
     try {
       // Start the logger
       try {
-        logger = new Logging(new PrintStream(new File("f:/temp/rhetoric_logs/log_"
+        logger = new Logging(new PrintStream(new File("s:/temp/rhetoric_logs/log_"
             + fileNameDateFormat.format(new Date())
             + ".log")), LOGGING_BUFFER);
         //        new Logging(System.out, LOGGING_BUFFER);
@@ -118,7 +119,130 @@ public class Main {
   static void test() {
     testSPQ();
     testSets();
-    testContent();
+    //testContent();
+    testConcurrency();
+  }
+  
+  static void testConcurrency() {
+    final int threadCount = 2;
+    final int testTime = 3; // seconds to test
+    TestThread[] testers = new TestThread[threadCount];
+    int[] lastMoveCount = new int[threadCount];
+    int lastDeferrals = 0;
+    
+    log("concurrency test", "starting concurrency test");
+    
+    TestThread.initializeEnvironment();
+    
+    log("concurrency test", "environment initialized");
+    
+    for (int i = 0; i < threadCount; i++)
+      testers[i] = new TestThread(i);
+    for (int i = 0; i < threadCount; i++)
+      testers[i].start();
+    
+    log("concurrency test", "threads started");
+    System.out.println("Concurrency test: 0 (of " + testTime + ")");
+    
+    for (int time = 0; time < testTime; time++) {
+      try {
+        Thread.sleep(1000);
+      } catch (InterruptedException ex) {
+        ex.printStackTrace();
+        break;
+      }
+      for (int i = 0; i < threadCount; i++) {
+        log("concurrency test", testers[i].getName() + ": " +
+            (testers[i].movesCompleted - lastMoveCount[i]) + " moves");
+        lastMoveCount[i] = testers[i].movesCompleted;
+      }
+      log("concurrency test", (Container.totalReservationDeferrals() - lastDeferrals) + " total deferrals");
+      lastDeferrals = Container.totalReservationDeferrals();
+      log("concurrency test", Container.activeReservations() + " active reservations");
+      log("concurrency test", Container.buildingReservations() + " building reservations");
+      System.out.println("Concurrency test: " + (time + 1));
+    }
+    log("concurrency test", "stopping test threads");
+    TestThread.stop = true;
+    log("concurrency test", "Current test environment shape:");
+    TestThread.logStructure();
+    while (true) {
+      try {
+        for (int i = 0; i < threadCount; i++)
+          testers[i].join();
+        break;
+      } catch (InterruptedException ex) {
+        continue;
+      }
+    }
+    log("concurrency test", "threads stopped");
+    log("concurrency test", (Container.totalReservationDeferrals() - lastDeferrals) + " total deferrals");
+    log("concurrency test", Container.activeReservations() + " active reservations");
+    log("concurrency test", Container.buildingReservations() + " building reservations");
+  }
+  
+  static class TestThread extends Thread {
+    static volatile boolean stop = false;
+    int movesCompleted = 0;
+    static final int roomCount = 4;
+    static final int objectCount = 100;
+    static Vector<Container> deck = new Vector<Container>();
+    
+    public TestThread(int number) {
+      super("TestThread" + number);
+    }
+    
+    static void initializeEnvironment() {
+      for (int i = 0; i < roomCount; i++)
+        TestThread.deck.add(new DebugRoom());
+      
+      for (int i = 0; i < objectCount; i++) {
+        Active x = new PlasticBag(TestThread.deck.get(rand.nextInt(roomCount)), "in");
+        TestThread.deck.add(x);
+        try {
+          x.init();
+        } catch (DoesNotFitException ex) {
+          log("concurrency test", "object did not fit! " + ex.getMessage());
+        }
+      }
+    }
+    
+    static void logStructure() {
+      for (int i = 0; i < roomCount; i++)
+        logStructure(deck.elementAt(i), 0);
+      log("concurrency test", "done outputting environment");
+    }
+    
+    static void logStructure(Container from, int tabs) {
+      log("concurrency test", new String(new char[tabs]).replace("\0", "\t") + from);
+      Active[] contents = from.allContents();
+      tabs++;
+      for (Active child : contents)
+        logStructure(child, tabs);
+    }
+    
+    @Override
+    public void run() {
+      try {
+        while (!stop) {
+          int movingIndex = ThreadLocalRandom.current().nextInt(objectCount) + roomCount;
+          int destinationIndex = ThreadLocalRandom.current().nextInt(deck.size() - 1);
+          if (destinationIndex >= movingIndex) destinationIndex++;
+          
+          Active moving = (Active)deck.get(movingIndex);
+          Container destination = deck.get(destinationIndex);
+          
+          log("concurrency test", getName() + " attempting to move " + moving + " into " + destination);
+          if (!destination.add(moving, "in", creator, fakeReport))
+            log("concurrency test", getName() + " could not move " + moving + " into " + destination);
+          movesCompleted++;
+        }
+      } catch (Exception ex) {
+        log("concurrency test", getName() + " crashed out!");
+        System.out.println("Error in " + getName());
+        ex.printStackTrace();
+      }
+    }
   }
   
   static void testSets() {

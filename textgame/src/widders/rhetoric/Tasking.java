@@ -1,7 +1,6 @@
 package widders.rhetoric;
 
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public class Tasking {
   private static final LinkedBlockingQueue<Runnable> taskQueue = new LinkedBlockingQueue<Runnable>();

@@ -51,7 +51,7 @@ public abstract class Container implements Named, Iterable<Active> {
   private static final int SHRINK_FACTOR = 4;
   private static final int COMFORTABLE_CAPACITY = 64;
   
-  // lock to enforce synchronicity on stats tracking
+  // lock to enforce synchronicity on stats tracking and contents
   private final ReentrantLock statSynchro = new ReentrantLock();
   
    /* These are only updated in the context of both this object's AND its container's synchro
@@ -100,8 +100,11 @@ public abstract class Container implements Named, Iterable<Active> {
   @SuppressWarnings("unused")
   private long dateDoomed = Long.MIN_VALUE;
   
-  /** Set to true when the object has finished initializing. */
+  /** Set to true when the object has finished initializing.
+   * Rooms are never initialized. */
   private volatile boolean initialized = false;
+  /** Set to true when the object is destroyed. */
+  private volatile boolean doomed = false;
   
   /** The ID allocator counter */
   private static AtomicLong nextID = new AtomicLong();
@@ -114,7 +117,7 @@ public abstract class Container implements Named, Iterable<Active> {
   private final ConcurrentLinkedQueue<Runnable> taskQueue = new ConcurrentLinkedQueue<Runnable>();
   
   
-  
+  /** Represents the dimensional statistics of an object */
   public static class Stats {
     protected double size, weight, length, width;
     
@@ -208,6 +211,7 @@ public abstract class Container implements Named, Iterable<Active> {
     }
   }
   
+  /** For internal use only, tracks the collective stats of the object's contents */
   private class ContentStats extends Stats {
     // force recompute size/weight totals at least after this many removals
     private static final int RECOMPUTE_INTERVAL = 1 << 10;
@@ -238,6 +242,11 @@ public abstract class Container implements Named, Iterable<Active> {
      *        True if content stats changed in any way
      */
     private boolean modify(Stats change) {
+      ///// TODO for safety, remove later
+      if (!statSynchro.isHeldByCurrentThread())
+        throw new Error("Stat synchro not held during content stat modification");
+      
+      
       boolean changed = false;
       
       // size
@@ -355,7 +364,7 @@ public abstract class Container implements Named, Iterable<Active> {
   
   /**
    * Creates a new Container inside the given container; if [spawnHere] is null,
-   * the Container is assumed to be a Room
+   * the Container must be a Room
    * 
    * @param name
    *          the object's name
@@ -414,18 +423,20 @@ public abstract class Container implements Named, Iterable<Active> {
    *         true only if this is an Active object in the world which has
    *         been successfully emplaced with init().
    */
-  public boolean initializedActive() {
-    return initialized;
+  public boolean isLiveObject() {
+    return (!doomed) && (initialized || container == null);
   }
   
-  /** Places an initializing object in this one */
+  /** Unconditionally places an initializing object in this one */
   private boolean emplace(Active obj, String preposition,
                           Active actor, Report r) {
     if (!authorizeAdd(obj, preposition, actor, r))
       return false;
     
     ((Container)obj).beginMovement(null);
-    enactAdd(obj, preposition);
+    boolean update = enactAdd(obj, preposition);
+    ((Container)obj).endMovement();
+    if (update) updateStats();
     
     r.report(obj + " was placed '" + preposition + "' " + this);
     
@@ -496,9 +507,14 @@ public abstract class Container implements Named, Iterable<Active> {
   }
   
   public final Active[] allContents() {
-    return contents == null
-        ? new Active[0]
-        : contents.toArray(new Active[contents.size()]);
+    statSynchro.lock();
+    try {
+      return contents == null
+          ? new Active[0]
+          : contents.toArray(new Active[contents.size()]);
+    } finally {
+      statSynchro.unlock();
+    }
   }
   
   /** Returns the number of contained items */
@@ -509,11 +525,11 @@ public abstract class Container implements Named, Iterable<Active> {
   }
   
   /** Returns the number of items contained recursively */
+  ///// TODO there should probably be a safer way to do this
   public final int contentCountDeep() {
-    if (contents == null)
-      return 0;
-    int t = contents.size();
-    for (Active content : contents)
+    Active[] list = allContents();
+    int t = list.length;
+    for (Active content : list)
       t += content.contentCountDeep();
     return t;
     //return contentCountDeep.get();
@@ -616,7 +632,7 @@ public abstract class Container implements Named, Iterable<Active> {
   
   /** Updates this object's size, weight, etc. */
   protected final void updateStats() {
-    if (!initialized)
+    if (!initialized || doomed)
       return;
     
     Stats newStats, sendStats;
@@ -632,33 +648,33 @@ public abstract class Container implements Named, Iterable<Active> {
         return;
       
       // freeze this object's movement
-      this.freezeMovement(null);
-      
-      // obtain stat lock of next container up to enforce ordering
-      container.statSynchro.lock();
-      
-      // update lastreported stats under this lock
-      lastReportedStats = newStats;
-      
+      this.freezeMovement();
     } finally {
       // release stat lock
       statSynchro.unlock();
     }
     
+    // obtain stat lock of next container up to enforce ordering
+    container.statSynchro.lock();
+    
+    // update lastreported stats under this lock
+    lastReportedStats = newStats;
+    
     /* at this point we hold statSynchro locks only on the container, and this
      * object is move-frozen */
     
     // propagate upwards
-    container.propagateContentStats(sendStats, this);
+    container.propagateStats(sendStats, this);
   }
   
-  /** Changes content stats and immediately propagates.
+  /** Changes content stats, updates local stats, and immediately propagates.
    * 
-   * The lock on this object's statSynchro must be held when this method is called.
+   * The lock on this object's statSynchro must be held when this method is called,
+   * and will be released before return.
    * 
    * propagatingFrom must be move-frozen or null; if it is non-null, it will be
    * unfrozen once. */
-  private void propagateContentStats(Stats change, Container propagatingFrom) {
+  private void propagateStats(Stats change, Container propagatingFrom) {
     /* laundry list:
      * the contents must stay the same while the parent is updating content
      * stats
@@ -712,7 +728,7 @@ public abstract class Container implements Named, Iterable<Active> {
         return;
       
       // freeze this object's movement
-      this.freezeMovement(null);
+      this.freezeMovement();
       
       // obtain stat lock of next container up to enforce ordering
       container.statSynchro.lock();
@@ -729,7 +745,7 @@ public abstract class Container implements Named, Iterable<Active> {
      * object is move-frozen */
     
     // propagate upwards
-    container.propagateContentStats(sendStats, this);
+    container.propagateStats(sendStats, this);
   }
   
   /** Returns the total size of the contents */
@@ -843,7 +859,7 @@ public abstract class Container implements Named, Iterable<Active> {
   }
   
   /** Prevents the object from being moved until moveUnfreeze() is called.
-   * Reentrant (4 billion times).
+   * Reentrant (4 billion times). May fail if a reservation is passed.
    * 
    * @param res
    *            The movement reservation currently claiming locks with this call,
@@ -853,6 +869,7 @@ public abstract class Container implements Named, Iterable<Active> {
    *            reservation is already in place to move this object, returns the
    *            superceding reservation, otherwise returns null (for success). */
   private Reservation freezeMovement(Reservation res) {
+    //Main.log("debug", this + " trying to freeze (" + moveFreeze + ")");
     moveSynchro.lock();
     try {
       if (moveFreeze == -1) { // object is being moved
@@ -875,6 +892,12 @@ public abstract class Container implements Named, Iterable<Active> {
     }
   }
   
+  /** Prevents the object from being moved until moveUnfreeze() is called.
+   * Reentrant. Cannot fail. */
+  private void freezeMovement() {
+    freezeMovement(null);
+  }
+  
   /** Undoes one layer of movement restriction from moveFreeze() */
   private void unfreezeMovement() {
     moveSynchro.lock();
@@ -892,11 +915,13 @@ public abstract class Container implements Named, Iterable<Active> {
     } finally {
       moveSynchro.unlock();
     }
+    //Main.log("debug", this + " unfroze (" + moveFreeze + ")");    
   }
   
   /** Prepares the object to be moved and prevents it from being frozen
    * until endMovement() is called */
   private void beginMovement(Reservation res) {
+    //Main.log("debug", this + " beginning movement (movefreeze is " + moveFreeze + ")");
     moveSynchro.lock();
     try {
       while (moveFreeze != 0)
@@ -905,8 +930,7 @@ public abstract class Container implements Named, Iterable<Active> {
       moveFreeze = -1; // set object to locked state
       currentReservation = res;
     } catch (InterruptedException e) {
-      System.out.println("Interrupted obtaining movement lock");
-      e.printStackTrace();
+      throw new Error("Interrupted obtaining movement lock");
     } finally {
       moveSynchro.unlock();
     }
@@ -933,25 +957,25 @@ public abstract class Container implements Named, Iterable<Active> {
   }
   
   // atomic version of { endMovement(); freezeMovement(); }
-  /** Releases the lock on the object but puts it into a frozen state. This is the
-   * equivalent of an atomic call to first endMovement() then freezeMovement().
-   * After this is called, it is imperative that unfreezeMovement() be called when finished. */
-  private void endMovementAndFreeze() {
-    moveSynchro.lock();
-    try {
-      if (moveFreeze != -1)
-        throw new IllegalMonitorStateException("Process attempted to end nonexistent"
-            + " movement phase");
-      
-      moveFreeze = 1;
-      currentReservation = null;
-      
-      // unpark waiting threads
-      movementEnds.signalAll();
-    } finally {
-      moveSynchro.unlock();
-    }
-  }
+//  /** Releases the lock on the object but puts it into a frozen state. This is the
+//   * equivalent of an atomic call to first endMovement() then freezeMovement().
+//   * After this is called, it is imperative that unfreezeMovement() be called when finished. */
+//  private void endMovementAndFreeze() {
+//    moveSynchro.lock();
+//    try {
+//      if (moveFreeze != -1)
+//        throw new IllegalMonitorStateException("Process attempted to end nonexistent"
+//            + " movement phase");
+//      
+//      moveFreeze = 1;
+//      currentReservation = null;
+//      
+//      // unpark waiting threads
+//      movementEnds.signalAll();
+//    } finally {
+//      moveSynchro.unlock();
+//    }
+//  }
   
   /** Provides functionality for obtaining locks for movement of objects
    * from one place to another */
@@ -965,6 +989,10 @@ public abstract class Container implements Named, Iterable<Active> {
     private final Condition finishCondition = lock.newCondition();
     private boolean finished = false;
     
+    private static final AtomicInteger totalDeferrals = new AtomicInteger();
+    private static final AtomicInteger totalBuilding = new AtomicInteger();
+    private static final AtomicInteger totalActive = new AtomicInteger();
+    
     /** Locks and freezes necessary objects and provides a Reservation that can unlock them
      * Returns null if the destination object is inside the moving object */
     public static Reservation create(Container moving, Container destination) {
@@ -972,7 +1000,13 @@ public abstract class Container implements Named, Iterable<Active> {
       
       final Reservation res = new Reservation(moving, frozen,
                                               nextReservationID.incrementAndGet());
+      int deferrals = 0;
+      totalBuilding.incrementAndGet();
       
+      Main.log("concurrency test", Thread.currentThread().getName() + " reserving to move "
+      + moving + " into " + destination + " (reservation" + res.reservationID + ")");
+      
+      new_attempt:
       while (true) { // let's make this work you and me
         // Lock the moving object
         moving.beginMovement(res);
@@ -987,6 +1021,7 @@ public abstract class Container implements Named, Iterable<Active> {
           Reservation priorReservation = c.freezeMovement(res);
           
           if (priorReservation != null) { // we need to defer to the other reservation
+            deferrals++;
             // unlock everything
             moving.endMovement();
             while (!frozen.isEmpty())
@@ -994,14 +1029,20 @@ public abstract class Container implements Named, Iterable<Active> {
             
             // defer and try again
             priorReservation.defer();
-            continue;
+            continue new_attempt;
           } else { // we're good to go
             frozen.push(c);
             if (c.container == moving) { // destination is inside Moving!
+              // this is the failure case
               // unlock everything
+              moving.endMovement();
               while (!frozen.isEmpty())
                 frozen.pop().unfreezeMovement();
-              moving.endMovement();
+              
+              res.signalFinished();
+              
+              totalBuilding.decrementAndGet();
+              totalDeferrals.addAndGet(deferrals);
               return null;
             }
           }
@@ -1009,8 +1050,12 @@ public abstract class Container implements Named, Iterable<Active> {
         }
         break;
       }
-
       
+      // this is the success case
+      
+      totalBuilding.decrementAndGet();
+      totalActive.incrementAndGet();
+      totalDeferrals.addAndGet(deferrals);
       return res;
     }
     
@@ -1036,32 +1081,53 @@ public abstract class Container implements Named, Iterable<Active> {
       if (finished)
         return;
       
-      lock.lock();
-      try {
-        moving.endMovementAndFreeze();
-        while (!frozen.isEmpty())
-          frozen.pop().unfreezeMovement();
+      moving.endMovement();
+      while (!frozen.isEmpty())
+        frozen.pop().unfreezeMovement();
         
-        // release deferring threads
-        finished = true;
-        finishCondition.signalAll();
-      } finally {
-        lock.unlock();
-      }
+      // release deferring threads
+      signalFinished();
+      
+      totalActive.decrementAndGet();
     }
     
     /** Blocks until this reservation is over */
     private void defer() {
       lock.lock();
       try {
+        Main.log("concurrency test", Thread.currentThread().getName() + " deferring on reservation" + reservationID);
         while (!finished)
           finishCondition.await();
+        Main.log("concurrency test", Thread.currentThread().getName() + " succeeded deferral on reservation" + reservationID);
       } catch (InterruptedException ex) {
         throw new Error("Interrupted during move reservation deferral", ex);
       } finally {
         lock.unlock();
       }
     }
+    
+    private void signalFinished() {
+      Main.log("concurrency test", Thread.currentThread().getName() + " signalling finished on reservation" + reservationID);
+      lock.lock();
+      try {
+        finished = true;
+        finishCondition.signalAll();
+      } finally {
+        lock.unlock();
+      }
+    }
+  }
+  
+  public static int activeReservations() {
+    return Reservation.totalActive.get();
+  }
+  
+  public static int buildingReservations() {
+    return Reservation.totalBuilding.get();
+  }
+  
+  public static int totalReservationDeferrals() {
+    return Reservation.totalDeferrals.get();
   }
   
   ///// TODO consider adding an expected from container
@@ -1076,6 +1142,15 @@ public abstract class Container implements Named, Iterable<Active> {
      * from and this must authorize- remove and add
      */
     
+    if (doomed) {
+      r.report("The " + name + " is doomed.");
+      return false;
+    }
+    
+    if (!isLiveObject()) {
+      throw new ObjectNotLiveException(this);
+    }
+    
     // obj must be initialized
     if (!((Container)obj).initialized)
       throw new IllegalArgumentException(obj + " has not been initialized");
@@ -1087,80 +1162,85 @@ public abstract class Container implements Named, Iterable<Active> {
     }
     
     Container from;
+    boolean updateFrom, updateTo;
     
     Reservation reservation = Reservation.create(obj, this);
     if (reservation == null) {
-      r.report("You cannot put something inside itself");
+      r.report("You cannot put something inside itself.");
       return false; // impossibru
     }
-    try {
-      from = obj.container();
-        
-      // obj must not be here already
-      if (from == this) { // pre-containment check
-        // obj will not be moving
-        reservation.end();
-        
-        if (obj.preposition().equals(prep)) {
-          // exit
-          ((Container)obj).unfreezeMovement();
-          r.report("The " + obj.name() + " is already there.");
-          return false; // already there
-        } else { // here but with different preposition
-          // shift the object inside this one instead of moving it in the tree
-          if (!obj.movable()) { // mobility check
-            // exit
-            ((Container)obj).unfreezeMovement();
-            r.report("The " + obj.name() + " is unmovable.");
-            return false; // can't move
-          } else if (authorizeRemove(obj, this, actor, r)
-              && authorizeAdd(obj, prep, actor, r)) { // authorization check
-            enactShift(obj, prep, actor);
-            ((Container)obj).unfreezeMovement();
-            return true; // hooray
-          } else {
-            ((Container)obj).unfreezeMovement();
-            return false; // not authorized
-          }
-          
-        }
-      }
-      
-      // obj must not be destroyed
-      if (from == null) {
-        reservation.end();
-        ((Container)obj).unfreezeMovement();
-        r.report("The " + obj.name() + " no longer exists.");
-        return false;
-      }
-      
-      // obj must be movable
-      if (!obj.movable()) {
-        reservation.end();
-        ((Container)obj).unfreezeMovement();
-        r.report("The " + obj.name() + " is unmovable.");
-        return false; // can't move
-      }
-      
-      // obj's current container must authorize the removal
-      // this container must authorize its addition
-      if (!from.authorizeRemove(obj, this, actor, r)
-          || !authorizeAdd(obj, prep, actor, r)) {
-        reservation.end();
-        ((Container)obj).unfreezeMovement();
-        return false; // not authorized
-      } else {
-        
-        
-        // NOW WE ACTUALLY DO THE MOVING BECAUSE IT'S OK
-        enactMove(obj, prep, actor);
-      }
-    } finally {
+    
+    from = obj.container();
+    
+    // obj must not be here already
+    if (from == this) { // pre-containment check
+      // obj will not be moving
       reservation.end();
+      
+      if (obj.preposition().equals(prep)) {
+        // exit
+        r.report("The " + obj.name() + " is already there.");
+        return false; // already there
+      } else { // here but with different preposition
+        // shift the object inside this one instead of moving it in the tree
+        if (!obj.movable()) { // mobility check
+          // exit
+          r.report("The " + obj.name() + " is unmovable.");
+          return false; // can't move
+        } else if (authorizeRemove(obj, this, actor, r)
+            && authorizeAdd(obj, prep, actor, r)) { // authorization check
+          enactShift(obj, prep, actor);
+          return true; // hooray
+        } else {
+          return false; // not authorized
+        }
+        
+      }
     }
     
-    ((Container)obj).unfreezeMovement();
+    // obj must not be destroyed
+    if (from == null) {
+      reservation.end();
+//      ((Container)obj).unfreezeMovement();
+      r.report("The " + obj.name() + " no longer exists.");
+      return false;
+    }
     
+    // obj must be movable
+    if (!obj.movable()) {
+      reservation.end();
+//      ((Container)obj).unfreezeMovement();
+      r.report("The " + obj.name() + " is unmovable.");
+      return false; // can't move
+    }
+    
+    // obj's current container must authorize the removal
+    // this container must authorize its addition
+    if (!from.authorizeRemove(obj, this, actor, r)
+        || !authorizeAdd(obj, prep, actor, r)) {
+      reservation.end();
+//      ((Container)obj).unfreezeMovement();
+      return false; // not authorized
+    }
+    
+    
+    // NOW WE ACTUALLY DO THE MOVING BECAUSE IT'S OK
+    updateFrom = enactRemove(obj);
+    updateTo = enactAdd(obj, prep);
+
+    reservation.end();
+    
+    Main.log("concurrency test", Thread.currentThread().getName() + " propagating from " + from + " -- " + obj + " --> " + this);
+    // propagate stats
+    if (updateFrom) from.updateStats();
+    if (updateTo) this.updateStats();
+    
+    
+    Main.log("movement", obj + " was moved to " + this + " by " + actor);
+    from.task(() -> from.onRemove(obj, this, actor)); // notify source    
+    this.task(() -> this.onAdd(obj, actor)); // notify destination
+    ((Container)obj).task(() -> obj.onMoved(actor)); // notify moved object
+
     return true;
   }
   
@@ -1168,7 +1248,7 @@ public abstract class Container implements Named, Iterable<Active> {
    * Removes the specified object to this container's container
    * (using the same preposition this object has in that container); if this
    * container is a room, the object is thrown into the Inferno.
-   */ /////TODO wat? fix this probably idk
+   */ /////TODO wat? fix this probably idk, this is probably not even wanted
   public final boolean remove(Active obj, Active actor, Report r) {
     if (!contains(obj)) { // necessary presence check
       r.report("The " + obj.name() + " is not in the "
@@ -1184,84 +1264,86 @@ public abstract class Container implements Named, Iterable<Active> {
   
   /** Destroys this object. */
   public final void destroy(Active actor) {
+    doomed = true;
+    dateDoomed = System.currentTimeMillis();
+
+    //Main.log("debug", this + " starting movement");
     beginMovement(null);
-    statSynchro.lock();
     try {
       if (container != null) {
-        enactRemove((Active)this);
-        container.task(() -> container.onRemove((Active)this, null, Main.physics));
+        if (enactRemove((Active)this)) container.updateStats();
+        
+        container.task(() -> container.onRemove((Active)this, null, Main.creator));
         container = null;
       }
-      if (contents != null)
-        while (!contents.isEmpty())
-          // destroy contents first
-          contents.peekLast().destroy(actor);
-      registry.remove(internalName);
-      dateDoomed = System.currentTimeMillis();
-      onDestroyed(actor);
     } finally {
-      statSynchro.unlock();
       endMovement();
+      //Main.log("debug", this + " movement ended");
     }
+    
+    if (contents != null)
+      while (!contents.isEmpty())
+        // destroy contents first
+        contents.peekLast().destroy(actor);
+    registry.remove(internalName);
+    task(() -> onDestroyed(actor));
     
     Main.log("destruction", this + " was incinerated by " + actor);
   }
   
-  ///// TODO the fuck is going on here
   /**
-   * Moves the given object into this container
+   * Unconditionally adds an object to this container
+   * and updates content stats without propagating.
+   * 
+   * The passed object should be in its movement phase.
+   * 
+   * Returns true if the container's content stats changed.
    */
-  private void enactMove(Active obj, String prep, Active actor) {
-    Container from = obj.container();
-    
-    ((Container)obj).statSynchro.lock();
-    try {
-      from.statSynchro.lock();
-      enactRemove(obj);
-      enactAdd(obj, prep);
-    } finally {
-      ((Container)obj).statSynchro.unlock();
-    }
-    
-    Main.log("movement", obj + " was moved to " + this + " by " + actor);
-    from.task(() -> from.onRemove(obj, this, actor)); // notify source    
-    this.task(() -> this.onAdd(obj, actor)); // notify destination
-    ((Container)obj).task(() -> obj.onMoved(actor)); // notify moved object
-  }
-  
-  /**
-   * Concurrency v2 enactAdd method.
-   * adds to this container unconditionally and propagates stats.
-   */
-  private void enactAdd(Active obj, String prep) {
+  private boolean enactAdd(Active obj, String prep) {
     if (this instanceof Active && !initialized)
       throw new Error(this + " has not been initialized");
     
-    ((Container)obj).container = this;
-    ((Container)obj).preposition = prep;
-    if (contents == null) // lazy initialization
-      contents = new RandomAccessLinkedHashSet<Active>();
-    contents.add(obj);
-    contentCountPeak = Math.max(contents.size(), contentCountPeak);
-    
-    ((Container)obj).endMovementAndFreeze();
-    propagateContentStats(((Container)obj).lastReportedStats, obj);
+    statSynchro.lock();
+    try {
+      ((Container)obj).container = this;
+      ((Container)obj).preposition = prep;
+      if (contents == null) // lazy initialization
+        contents = new RandomAccessLinkedHashSet<Active>();
+      contents.add(obj);
+      contentCountPeak = Math.max(contents.size(), contentCountPeak);
+      
+      return contentStats.modify(((Container)obj).lastReportedStats);
+    } finally {
+      statSynchro.unlock();
+    }
   }
   
   /**
-   * Concurrency v2 enactRemove method.
-   * Unconditionally removes the object from its container and propagates stats.
+   * Unconditionally removes the object from its container
+   * and updates content stats without propagating.
+   * 
+   * The passed object should be in its movement phase.
+   * 
+   * Returns true if the container's content stats changed.
    */
-  private static void enactRemove(Active obj) {
+  private static boolean enactRemove(Active obj) {
     Container from = ((Container)obj).container;
-    from.contents.remove(obj);
     
-    if (from.contentCountPeak > MAX_COMFORTABLE_CAPACITY
-        && from.contents.size() <= from.contentCountPeak >>> SHRINK_FACTOR) {
-      from.contents.shrink(COMFORTABLE_CAPACITY);
-      from.contentCountPeak = from.contents.size();
+    from.statSynchro.lock();
+    try {
+      from.contents.remove(obj);
+      //from.propagateStats(((Container)obj).lastReportedStats.getRemovalChange(), null);
+      
+      if (from.contentCountPeak > MAX_COMFORTABLE_CAPACITY
+          && from.contents.size() <= from.contentCountPeak >>> SHRINK_FACTOR) {
+        from.contents.shrink(COMFORTABLE_CAPACITY);
+        from.contentCountPeak = from.contents.size();
+      }
+      
+      return from.contentStats.modify(((Container)obj).lastReportedStats.getRemovalChange());
+    } finally {
+      from.statSynchro.unlock();
     }
-    from.propagateContentStats(((Container)obj).lastReportedStats.getRemovalChange(), null);
   }
   
   /**
