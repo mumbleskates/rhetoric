@@ -51,13 +51,13 @@ public abstract class Container implements Named, Iterable<Active> {
   private static final int SHRINK_FACTOR = 4;
   private static final int COMFORTABLE_CAPACITY = 64;
   
-  // lock to enforce synchronicity on stats tracking and contents
+  /** Lock to enforce synchronicity on content stats tracking */
   private final ReentrantLock statSynchro = new ReentrantLock();
   
-   /* These are only updated in the context of both this object's AND its container's synchro
-   Therefore, locking your own synchro guarantees stability of the lastReported
-   values of all your contained objects */
+  /** Lock to allow collapsing propagation */
+  private final ReentrantLock propagationSynchro = new ReentrantLock();
   private Stats lastReportedStats;
+  private Stats newStats = null;
   
   /* Synchronized to this container's synchro */
   private ContentStats contentStats = new ContentStats();
@@ -203,11 +203,20 @@ public abstract class Container implements Named, Iterable<Active> {
       return new Stats(changeSize, changeWeight, changeLength, changeWidth);
     }
     
-    private boolean isZero() {
-      return size == 0d
-          && weight == 0d
-          && length == 0d
-          && width == 0d;
+    public boolean equals(Stats other) {
+      return size == other.size
+          && weight == other.weight
+          && length == other.length
+          && width == other.width;
+    }
+    
+    @Override
+    public String toString() {
+      return "Stats{ size=" + size + "m3"
+          + ", weight=" + weight + "kg"
+          + ", length=" + length + "m"
+          + ", width=" + width + "m"
+          + " }";
     }
   }
   
@@ -381,7 +390,7 @@ public abstract class Container implements Named, Iterable<Active> {
         ? null
         : preposition.intern();
     this.name = name;
-    internalName = name + "~" + iD;
+    internalName = name + "_" + iD;
     registry.put(internalName, this);
   }
   
@@ -622,12 +631,13 @@ public abstract class Container implements Named, Iterable<Active> {
   
   /** Returns the current stats of this object */
   public final Stats stats() {
-    statSynchro.lock();
-    try {
-      return new Stats(this);
-    } finally {
-      statSynchro.unlock();
-    }
+//    statSynchro.lock();
+//    try {
+//      return new Stats(this);
+//    } finally {
+//      statSynchro.unlock();
+//    }
+    return lastReportedStats;
   }
   
   /** Updates this object's size, weight, etc. */
@@ -635,30 +645,66 @@ public abstract class Container implements Named, Iterable<Active> {
     if (!initialized || doomed)
       return;
     
-    Stats newStats, sendStats;
+    Stats sendStats;
     
+    freezeMovement();
+//    Main.log("concurrency", Thread.currentThread().getName() + " acquiring statSynchro of " + this);
     statSynchro.lock();
     try {
       // update this object's lastreported stats
-      newStats = new Stats(this);
-      sendStats = lastReportedStats.getChange(newStats);
+      propagationSynchro.lock();
+      try {
+        boolean firstIn = false;
+        if (newStats == null)
+          firstIn = true;
+        
+        newStats = new Stats(this);
+        // if local stats didn't change, exit
+        if (newStats.equals(lastReportedStats)) {
+          newStats = null;
+          unfreezeMovement();
+          return;
+        }
+        
+        // someone else is already waiting to continue propagation
+        if (!firstIn) {
+//          Main.log("concurrency", Thread.currentThread().getName() + " collapsing propagation at " + this);
+          unfreezeMovement();
+          return;
+        }
+      } finally {
+        propagationSynchro.unlock();
+      }
       
-      // if local stats didn't change, exit
-      if (sendStats.isZero())
-        return;
-      
-      // freeze this object's movement
-      this.freezeMovement();
     } finally {
       // release stat lock
+//      Main.log("concurrency", Thread.currentThread().getName() + " releasing statSynchro of " + this);
       statSynchro.unlock();
     }
     
-    // obtain stat lock of next container up to enforce ordering
+    // obtain stat lock of next container up
+    container.freezeMovement();
+//    Main.log("concurrency", Thread.currentThread().getName() + " acquiring statSynchro of " + container);
     container.statSynchro.lock();
     
-    // update lastreported stats under this lock
-    lastReportedStats = newStats;
+    propagationSynchro.lock();
+    try {
+      // if we aren't changing stats after all...
+      if (newStats == null) {
+        // unlock everything and finish
+        container.statSynchro.unlock();
+        container.unfreezeMovement();
+        unfreezeMovement();
+        return;
+      }
+      
+      // update lastreported stats under this lock
+      sendStats = lastReportedStats.getChange(newStats);
+      lastReportedStats = newStats;
+      newStats = null;
+    } finally {
+      propagationSynchro.unlock();
+    }
     
     /* at this point we hold statSynchro locks only on the container, and this
      * object is move-frozen */
@@ -670,35 +716,13 @@ public abstract class Container implements Named, Iterable<Active> {
   /** Changes content stats, updates local stats, and immediately propagates.
    * 
    * The lock on this object's statSynchro must be held when this method is called,
-   * and will be released before return.
+   * and will be released before return. This object must also be move-frozen,
+   * and will be unfrozen on return.
    * 
    * propagatingFrom must be move-frozen or null; if it is non-null, it will be
    * unfrozen once. */
   private void propagateStats(Stats change, Container propagatingFrom) {
-    /* laundry list:
-     * the contents must stay the same while the parent is updating content
-     * stats
-     * after content stats are updated the contents are free to move again
-     * 
-     * - content stats can only change when statsynchro is held
-     * - local stats can only change when the object is move-frozen
-     * - local stats are dependent on content stats
-     * - therefore lastreported stats members must be updated while frozen and
-     * synced
-     * 
-     * 1. modify container's content stats from parameters
-     * 2. unfreeze content's movement if there was one
-     * 3. if this is a room, release stat lock and exit
-     * 4. if content stats did not change, release stat lock and exit
-     * 5. freeze this object's movement (undone by 7, at next level 2)
-     * 8. obtain stat lock of next container up to ensure order (undone at next level by 3, 4, 7)
-     * 6. update this object's lastreported stats
-     * 7. if local stats didn't change, unfreeze unlock and exit
-     * 9. release stat lock
-     * 10. propagate the next container up
-     */
-    
-    Stats newStats, sendStats;
+    Stats sendStats;
     
     /* on entry to this method, propagatingFrom is either null or move-frozen and
      * the lock to this object's statSynchro is already held */
@@ -711,34 +735,71 @@ public abstract class Container implements Named, Iterable<Active> {
       if (propagatingFrom != null)
         propagatingFrom.unfreezeMovement();
       
-      // if contents did not change, exit (releasing stat lock)
-      if (!contentChanged)
+      // if contents did not change, exit (releasing stat lock and unfreezing)
+      if (!contentChanged) {
+        unfreezeMovement();
         return;
+      }
       
-      // if this is a room, exit (releasing stat lock)
-      if (container == null)
+      // if this is a room, exit (releasing stat lock and unfreezing)
+      if (container == null) {
+        unfreezeMovement();
         return;
+      }
       
       // update this object's lastreported stats
-      newStats = new Stats(this);
-      sendStats = lastReportedStats.getChange(newStats);
-      
-      // if local stats didn't change, exit
-      if (sendStats.isZero())
-        return;
-      
-      // freeze this object's movement
-      this.freezeMovement();
-      
-      // obtain stat lock of next container up to enforce ordering
-      container.statSynchro.lock();
-      
-      // update lastreported stats under this lock
-      lastReportedStats = newStats;
+      propagationSynchro.lock();
+      try {
+        boolean firstIn = false;
+        if (newStats == null)
+          firstIn = true;
+        
+        newStats = new Stats(this);
+        // if local stats didn't change, exit
+        if (newStats.equals(lastReportedStats)) {
+          newStats = null;
+          unfreezeMovement();
+          return;
+        }
+        
+        // someone else is already waiting to continue propagation
+        if (!firstIn) {
+//          Main.log("concurrency", Thread.currentThread().getName() + " collapsing propagation at " + this);
+          unfreezeMovement();
+          return;
+        }
+      } finally {
+        propagationSynchro.unlock();
+      }
       
     } finally {
       // release stat lock
+//      Main.log("concurrency", Thread.currentThread().getName() + " releasing statSynchro of " + this);
       statSynchro.unlock();
+    }
+    
+    // obtain stat lock of next container up to enforce ordering
+    container.freezeMovement();
+//    Main.log("concurrency", Thread.currentThread().getName() + " acquiring statSynchro of " + container);
+    container.statSynchro.lock();
+    
+    propagationSynchro.lock();
+    try {
+      // if we aren't changing stats after all...
+      if (newStats == null) {
+        // unlock everything and finish
+        container.statSynchro.unlock();
+        container.unfreezeMovement();
+        unfreezeMovement();
+        return;
+      }
+      
+      // update lastreported stats under this lock
+      sendStats = lastReportedStats.getChange(newStats);
+      lastReportedStats = newStats;
+      newStats = null;
+    } finally {
+      propagationSynchro.unlock();
     }
     
     /* at this point we hold statSynchro locks only on the container, and this
@@ -770,7 +831,7 @@ public abstract class Container implements Named, Iterable<Active> {
   
   /** Returns the length of the longest contained item */
   public final double longestContent() {
-    statSynchro.lock();
+    statSynchro.lock(); ///// TODO implement copy-on-write for contentstats so we don't need to lock this shit
     try {
       return contentStats.length;
     } finally {
@@ -872,21 +933,28 @@ public abstract class Container implements Named, Iterable<Active> {
     //Main.log("debug", this + " trying to freeze (" + moveFreeze + ")");
     moveSynchro.lock();
     try {
-      if (moveFreeze == -1) { // object is being moved
+      // holy shit this used to be an 'if' and it drove me nuts
+      while (moveFreeze == -1) { // object is being moved 
         // if the lock we encountered is held by an older reservation...
         if (res != null && currentReservation != null
             && res.getID() > currentReservation.getID()) {
           // fail and return reservation to defer to
           return currentReservation;
         } else {
+          // TODO this is debug:
+//          Main.log("concurrency", Thread.currentThread().getName()
+//                   + " will not defer while freezing " + this);
+          
           // either we have precedence or we don't care, force a wait
           movementEnds.await();
         }
       }
       moveFreeze++;
+//      Main.log("concurrency", Thread.currentThread().getName() + " froze " + this);
       return null; // success
     } catch (InterruptedException ex) {
-      throw new Error("Interrupted while waiting to freeze an object", ex);
+      throw new Error(Thread.currentThread().getName()
+                      + " interrupted while waiting to freeze " + this, ex);
     } finally {
       moveSynchro.unlock();
     }
@@ -903,13 +971,14 @@ public abstract class Container implements Named, Iterable<Active> {
     moveSynchro.lock();
     try {
       if (moveFreeze == 0)
-        throw new IllegalMonitorStateException("unfreezeMovement() called on an already"
-            + " unfrozen object!");
+        throw new IllegalMonitorStateException(Thread.currentThread().getName()
+            + " called unfreezeMovement() on an already unfrozen object " + this);
       if (moveFreeze == -1)
-        throw new IllegalMonitorStateException("unfreezeMovement() called on an object"
-            + " in its move phase!");
+        throw new IllegalMonitorStateException(Thread.currentThread().getName()
+            + " called unfreezeMovement() on an object in its move phase: " + this);
       
       moveFreeze--;
+//      Main.log("concurrency", Thread.currentThread().getName() + " unfroze " + this);
       if (moveFreeze == 0)
         movementUnfreezes.signal();
     } finally {
@@ -921,12 +990,14 @@ public abstract class Container implements Named, Iterable<Active> {
   /** Prepares the object to be moved and prevents it from being frozen
    * until endMovement() is called */
   private void beginMovement(Reservation res) {
-    //Main.log("debug", this + " beginning movement (movefreeze is " + moveFreeze + ")");
     moveSynchro.lock();
     try {
-      while (moveFreeze != 0)
+      while (moveFreeze != 0) {
+//        Main.log("concurrency", Thread.currentThread().getName() + " waiting for " + this + " to unfreeze");
         movementUnfreezes.await();
+      }
       
+//      Main.log("concurrency", Thread.currentThread().getName() + " beginning movement for " + this);
       moveFreeze = -1; // set object to locked state
       currentReservation = res;
     } catch (InterruptedException e) {
@@ -942,13 +1013,15 @@ public abstract class Container implements Named, Iterable<Active> {
     try {
       ///// possibly add thread safety tracker here
       if (moveFreeze != -1)
-        throw new IllegalMonitorStateException("Process attempted to end nonexistent"
-            + " movement phase");
+        throw new IllegalMonitorStateException(Thread.currentThread().getName()
+            + " attempted to end nonexistent movement phase on " + this);
       
       moveFreeze = 0;
       currentReservation = null;
       
-     // unpark waiting threads
+//      Main.log("concurrency", Thread.currentThread().getName() + " ending movement for " + this);
+      
+      // unpark waiting threads
       movementUnfreezes.signal();
       movementEnds.signalAll();
     } finally {
@@ -987,7 +1060,7 @@ public abstract class Container implements Named, Iterable<Active> {
     
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition finishCondition = lock.newCondition();
-    private boolean finished = false;
+    private volatile boolean finished = false;
     
     private static final AtomicInteger totalDeferrals = new AtomicInteger();
     private static final AtomicInteger totalBuilding = new AtomicInteger();
@@ -1003,8 +1076,8 @@ public abstract class Container implements Named, Iterable<Active> {
       int deferrals = 0;
       totalBuilding.incrementAndGet();
       
-      Main.log("concurrency test", Thread.currentThread().getName() + " reserving to move "
-      + moving + " into " + destination + " (reservation" + res.reservationID + ")");
+//      Main.log("concurrency", Thread.currentThread().getName() + " reserving to move "
+//      + moving + " into " + destination + " (" + res + ")");
       
       new_attempt:
       while (true) { // let's make this work you and me
@@ -1032,8 +1105,11 @@ public abstract class Container implements Named, Iterable<Active> {
             continue new_attempt;
           } else { // we're good to go
             frozen.push(c);
-            if (c.container == moving) { // destination is inside Moving!
+            
+            // check for invalid move
+            if (c.container == moving) { // destination is inside moving!
               // this is the failure case
+//              Main.log("concurrency", Thread.currentThread().getName() + " failing to reserve " + moving + " --> " + destination);
               // unlock everything
               moving.endMovement();
               while (!frozen.isEmpty())
@@ -1056,6 +1132,7 @@ public abstract class Container implements Named, Iterable<Active> {
       totalBuilding.decrementAndGet();
       totalActive.incrementAndGet();
       totalDeferrals.addAndGet(deferrals);
+//      Main.log("concurrency", Thread.currentThread().getName() + " built " + res + " successfully");
       return res;
     }
     
@@ -1075,8 +1152,9 @@ public abstract class Container implements Named, Iterable<Active> {
      * ended, leaving it in a frozen state. */
     public void end() {
       if (Thread.currentThread() != owner)
-        throw new IllegalMonitorStateException("Non-owning thread attempted to end a"
-            + " move reservation");
+        throw new IllegalMonitorStateException("Non-owning thread "
+      + Thread.currentThread().getName() + " attempted to end a move reservation on "
+            + this);
       
       if (finished)
         return;
@@ -1095,10 +1173,10 @@ public abstract class Container implements Named, Iterable<Active> {
     private void defer() {
       lock.lock();
       try {
-        Main.log("concurrency test", Thread.currentThread().getName() + " deferring on reservation" + reservationID);
+//        Main.log("concurrency", Thread.currentThread().getName() + " deferring on " + this);
         while (!finished)
           finishCondition.await();
-        Main.log("concurrency test", Thread.currentThread().getName() + " succeeded deferral on reservation" + reservationID);
+//        Main.log("concurrency", Thread.currentThread().getName() + " succeeded deferral on " + this);
       } catch (InterruptedException ex) {
         throw new Error("Interrupted during move reservation deferral", ex);
       } finally {
@@ -1107,7 +1185,7 @@ public abstract class Container implements Named, Iterable<Active> {
     }
     
     private void signalFinished() {
-      Main.log("concurrency test", Thread.currentThread().getName() + " signalling finished on reservation" + reservationID);
+//      Main.log("concurrency", Thread.currentThread().getName() + " signalling finished on " + this);
       lock.lock();
       try {
         finished = true;
@@ -1115,6 +1193,11 @@ public abstract class Container implements Named, Iterable<Active> {
       } finally {
         lock.unlock();
       }
+    }
+    
+    @Override
+    public String toString() {
+      return "reservation" + reservationID;
     }
   }
   
@@ -1230,7 +1313,7 @@ public abstract class Container implements Named, Iterable<Active> {
 
     reservation.end();
     
-    Main.log("concurrency test", Thread.currentThread().getName() + " propagating from " + from + " -- " + obj + " --> " + this);
+//    Main.log("concurrency", Thread.currentThread().getName() + " propagating from " + from + " -- " + obj + " --> " + this);
     // propagate stats
     if (updateFrom) from.updateStats();
     if (updateTo) this.updateStats();
@@ -1303,6 +1386,7 @@ public abstract class Container implements Named, Iterable<Active> {
     if (this instanceof Active && !initialized)
       throw new Error(this + " has not been initialized");
     
+//    Main.log("concurrency", Thread.currentThread().getName() + " acquiring statSynchro of " + this + " to add");
     statSynchro.lock();
     try {
       ((Container)obj).container = this;
@@ -1314,6 +1398,7 @@ public abstract class Container implements Named, Iterable<Active> {
       
       return contentStats.modify(((Container)obj).lastReportedStats);
     } finally {
+//      Main.log("concurrency", Thread.currentThread().getName() + " releasing statSynchro of " + this);
       statSynchro.unlock();
     }
   }
@@ -1329,10 +1414,10 @@ public abstract class Container implements Named, Iterable<Active> {
   private static boolean enactRemove(Active obj) {
     Container from = ((Container)obj).container;
     
+//    Main.log("concurrency", Thread.currentThread().getName() + " acquiring statSynchro of " + from + " to remove");
     from.statSynchro.lock();
     try {
       from.contents.remove(obj);
-      //from.propagateStats(((Container)obj).lastReportedStats.getRemovalChange(), null);
       
       if (from.contentCountPeak > MAX_COMFORTABLE_CAPACITY
           && from.contents.size() <= from.contentCountPeak >>> SHRINK_FACTOR) {
@@ -1342,6 +1427,7 @@ public abstract class Container implements Named, Iterable<Active> {
       
       return from.contentStats.modify(((Container)obj).lastReportedStats.getRemovalChange());
     } finally {
+//      Main.log("concurrency", Thread.currentThread().getName() + " releasing statSynchro of " + from);
       from.statSynchro.unlock();
     }
   }
@@ -1467,7 +1553,7 @@ public abstract class Container implements Named, Iterable<Active> {
   @Override
   protected final void finalize() throws Throwable {
     //preFinalize();
-    /* Main.debug.p("finalized", toString()
+    /* Main.log("finalized", toString()
      * + " / lived for " + (dateDoomed - dateCreated) + "ms"
      * + ", doomed for " + (System.currentTimeMillis() - dateDoomed) + "ms"); */
   }

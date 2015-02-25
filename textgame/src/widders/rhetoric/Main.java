@@ -27,7 +27,7 @@ import junit.framework.TestResult;
 public class Main {
   
   public static final int SCHEDULER_THREAD_COUNT = 3;
-  public static final int LOGGING_BUFFER = 1 << 24;
+  public static final int LOGGING_BUFFER = 1 << 30;
   
   /** The main Debug object */
   public static Logging logger;
@@ -115,7 +115,6 @@ public class Main {
     }
   }
   
-  ///// TODO add concurrency test
   static void test() {
     testSPQ();
     testSets();
@@ -124,17 +123,22 @@ public class Main {
   }
   
   static void testConcurrency() {
-    final int threadCount = 2;
-    final int testTime = 3; // seconds to test
+    final int threadCount = 20;
+    final int testTime = 10; // seconds to test
     TestThread[] testers = new TestThread[threadCount];
     int[] lastMoveCount = new int[threadCount];
     int lastDeferrals = 0;
     
     log("concurrency test", "starting concurrency test");
+    log("concurrency test", "thread count: " + threadCount);
+    log("concurrency test", "# of rooms: " + TestThread.roomCount);
+    log("concurrency test", "# of objects:" + TestThread.objectCount);
     
     TestThread.initializeEnvironment();
     
     log("concurrency test", "environment initialized");
+    
+    long testStarted = Chronology.now();
     
     for (int i = 0; i < threadCount; i++)
       testers[i] = new TestThread(i);
@@ -146,11 +150,13 @@ public class Main {
     
     for (int time = 0; time < testTime; time++) {
       try {
-        Thread.sleep(1000);
+        Thread.sleep(1000 + (testStarted + time * 1000 - Chronology.now()));
       } catch (InterruptedException ex) {
         ex.printStackTrace();
         break;
       }
+      long now = Chronology.now();
+      while ((now - (testStarted + time * 1000)) > 1000) time++;
       for (int i = 0; i < threadCount; i++) {
         log("concurrency test", testers[i].getName() + ": " +
             (testers[i].movesCompleted - lastMoveCount[i]) + " moves");
@@ -164,28 +170,36 @@ public class Main {
     }
     log("concurrency test", "stopping test threads");
     TestThread.stop = true;
+    try {
+      Thread.sleep(1000);
+    } catch (InterruptedException ex) { }
+    for (int i = 0; i < threadCount; i++) {
+      System.out.println("\n" + testers[i].getName() + " trace:");
+      StackTraceElement[] stk = testers[i].getStackTrace();
+      for (int j = 0; j < stk.length; j++)
+        System.out.println(stk[j]);
+    }
+    int totalMoves = 0;
+    try {
+      for (int i = 0; i < threadCount; i++) {
+        testers[i].join();
+        totalMoves += testers[i].movesCompleted;
+      }
+    } catch (InterruptedException ex) { throw new Error(ex); }
     log("concurrency test", "Current test environment shape:");
     TestThread.logStructure();
-    while (true) {
-      try {
-        for (int i = 0; i < threadCount; i++)
-          testers[i].join();
-        break;
-      } catch (InterruptedException ex) {
-        continue;
-      }
-    }
+    
     log("concurrency test", "threads stopped");
-    log("concurrency test", (Container.totalReservationDeferrals() - lastDeferrals) + " total deferrals");
-    log("concurrency test", Container.activeReservations() + " active reservations");
-    log("concurrency test", Container.buildingReservations() + " building reservations");
+    log("concurrency test", totalMoves + " total moves completed in " + ((Chronology.now() - testStarted) / 1000d) + " seconds");
+    log("concurrency test", (Container.totalReservationDeferrals()) + " total deferrals");
+    log("concurrency test", "concurrency test done");
   }
   
   static class TestThread extends Thread {
     static volatile boolean stop = false;
     int movesCompleted = 0;
     static final int roomCount = 4;
-    static final int objectCount = 100;
+    static final int objectCount = 500;
     static Vector<Container> deck = new Vector<Container>();
     
     public TestThread(int number) {
@@ -214,31 +228,32 @@ public class Main {
     }
     
     static void logStructure(Container from, int tabs) {
-      log("concurrency test", new String(new char[tabs]).replace("\0", "\t") + from);
-      Active[] contents = from.allContents();
+      log("concurrency test", new String(new char[tabs]).replace("\0", "\t") + from + " " + from.stats());
+      //Active[] contents = from.allContents();
       tabs++;
-      for (Active child : contents)
+      for (Active child : from)//contents)
         logStructure(child, tabs);
     }
     
     @Override
     public void run() {
+      Random rand = ThreadLocalRandom.current();
       try {
         while (!stop) {
-          int movingIndex = ThreadLocalRandom.current().nextInt(objectCount) + roomCount;
-          int destinationIndex = ThreadLocalRandom.current().nextInt(deck.size() - 1);
+          int movingIndex = rand.nextInt(objectCount) + roomCount;
+          int destinationIndex = rand.nextInt(deck.size() - 1);
           if (destinationIndex >= movingIndex) destinationIndex++;
           
           Active moving = (Active)deck.get(movingIndex);
           Container destination = deck.get(destinationIndex);
           
-          log("concurrency test", getName() + " attempting to move " + moving + " into " + destination);
+          log("concurrency thread", getName() + " attempting to move " + moving + " into " + destination);
           if (!destination.add(moving, "in", creator, fakeReport))
-            log("concurrency test", getName() + " could not move " + moving + " into " + destination);
+            log("concurrency thread", getName() + " could not move " + moving + " into " + destination);
           movesCompleted++;
         }
       } catch (Exception ex) {
-        log("concurrency test", getName() + " crashed out!");
+        log("concurrency thread", getName() + " crashed out!");
         System.out.println("Error in " + getName());
         ex.printStackTrace();
       }
@@ -397,6 +412,10 @@ public class Main {
     switch (topic) {
       case "creation":
       case "destruction":
+      case "movement":
+      case "concurrency":
+      case "concurrency thread":
+      //case "concurrency test":
         return;
       
       default:

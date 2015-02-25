@@ -53,17 +53,17 @@ public class PlasticBag extends Active {
 
   @Override
   public double availableSize() {
-    return 3 * GALLON - contentSize();
+    return Math.min(3 * GALLON - contentSize(), container().availableSize());
   }
 
   @Override
   public double lengthLimit() {
-    return .5 * METER;
+    return Math.min(.5 * METER, container().lengthLimit());
   }
 
   @Override
   public double widthLimit() {
-    return .5 * METER;
+    return Math.min(.5 * METER, container().lengthLimit());
   }
 
   @Override

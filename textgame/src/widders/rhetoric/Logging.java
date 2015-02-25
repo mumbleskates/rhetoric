@@ -89,7 +89,8 @@ public class Logging extends Thread {
     queue.offer(event);
     currentBufferSize.addAndGet(event.size);
     
-    if (currentBufferSize.get() >= maxBufferSize) {
+    ///// TODO test whether it's faster to recruit to expel events or to block on a has-space condition
+    while (currentBufferSize.get() >= maxBufferSize) {
       // output periodic warnings
       if ((bufferWarningCounter.get() & LOG_WARNING_MASK) == 0)
         outputQueueWarning();
